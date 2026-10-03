@@ -296,6 +296,10 @@ class InvalidIdentifier(CoalesceDBError): ...         # Bad db/table/column/user
 class DatabaseNotFound(CoalesceDBError): ...
 class DatabaseExists(CoalesceDBError): ...
 
+class InvalidPassword(CoalesceDBError): ...           # Too short / too long (§6.1)
+class UserExists(CoalesceDBError): ...                # Username already taken
+class UserNotFound(CoalesceDBError): ...              # No user with that id
+
 class SQLRejected(CoalesceDBError): ...               # Guard rejected; .reasons: list[str]
 class SQLParseError(SQLRejected): ...
 class QueryTimeout(CoalesceDBError): ...
@@ -306,6 +310,11 @@ class LLMOutputInvalid(CoalesceDBError): ...          # Failed validation after 
 
 class IngestError(CoalesceDBError): ...               # Unreadable/oversized/encrypted/scanned file
 ```
+
+Two rules for these errors:
+
+- `login` raises only `AuthError` ("Invalid username or password") or `AccountLockedError`. It never raises `UserNotFound` or `InvalidIdentifier`, so it doesn't reveal whether a username exists.
+- No error message ever includes a password.
 
 ---
 
@@ -443,7 +452,7 @@ CREATE TABLE audit_log (
 
 **Username rules** (`auth/service.py`): must match `^[A-Za-z][A-Za-z0-9_.-]{2,31}\Z`, checked with `.fullmatch()`. (`\Z`, not `$`: in Python `$` also matches just before a trailing newline, so `"abc\n"` would slip through.) This makes it impossible for a username to contain SQL syntax (no spaces, quotes, semicolons or parentheses). Usernames are *also* only ever passed as bound parameters (`?`), never formatted into SQL. Both protections are required.
 
-**Password rules:** minimum 10 characters; hashed with Argon2id (`argon2.PasswordHasher()` defaults); `check_needs_rehash` applied on login.
+**Password rules:** minimum 8 characters, maximum 1024 (Argon2 is deliberately slow, so an unbounded password is a cheap way to stall the app); anything else raises `InvalidPassword`, whose message never contains the password; hashed with Argon2id (`argon2.PasswordHasher()` defaults); `check_needs_rehash` applied on login.
 
 ```python
 # auth/passwords.py
@@ -466,26 +475,57 @@ class AuthService:
     def login(self, username: str, password: str) -> User: ...
         # Raises AuthError (generic "Invalid username or password") or AccountLockedError.
         # Runs a dummy verify when the user doesn't exist to equalize timing.
+        # A malformed username gets the same generic AuthError and the same dummy verify.
         # Increments failed_attempts; locks for login_lockout_s after login_max_failures.
-        # Audits both success and failure.
+        # While locked: AccountLockedError(retry_after_s=...) even for the right password,
+        # and the lock is not extended. Once the lock has expired the counter restarts at 0.
+        # A successful login clears the counter and the lock.
+        # Audits both success and failure. A failed login for an existing user records its
+        # user_id; for an unknown or malformed username the detail is only
+        # {"reason": "unknown_user"} — never the typed text, because people sometimes type
+        # their password into the username box.
 
     def create_user(self, actor: User, username: str, password: str, superadmin: bool = False) -> User: ...
     def delete_user(self, actor: User, user_id: int) -> None: ...     # Cannot delete last superadmin
-    def change_password(self, actor: User, user_id: int, new_password: str) -> None: ...
+    def change_password(self, actor: User, user_id: int, new_password: str,
+                        current_password: str | None = None) -> None: ...
+        # Own password (actor.id == user_id, superadmins included): current_password is
+        #   required and must verify. Missing or wrong → AuthError, counted as a failed
+        #   attempt toward the lockout exactly like a failed login (login_max_failures wrong
+        #   ones lock the account; a locked account gets AccountLockedError). Success clears
+        #   the counter, like a successful login.
+        # Superadmin changing someone else's password: no current_password needed; the reset
+        #   also clears that user's failed_attempts and locked_until.
+        # Anyone else → PermissionDenied.
     def list_users(self, actor: User) -> list[User]: ...
 
     def grant(self, actor: User, user_id: int, db_name: str, role: Role) -> None: ...
     def revoke(self, actor: User, user_id: int, db_name: str) -> None: ...
     def role_for(self, user: User, db_name: str) -> Role | None: ...
         # Superadmins are ADMIN on every DB. Others: grant row or None (no access).
-    def accessible_databases(self, user: User) -> list[tuple[str, Role]]: ...
+        # None means "valid name, no access"; a malformed db_name raises InvalidIdentifier.
+    def accessible_databases(self, user: User, *,
+                             all_databases: Collection[str]) -> list[tuple[str, Role]]: ...
+        # all_databases is required: AuthService cannot list database files itself (the
+        # registry, §6.3, depends on AuthService, not the other way round).
+        # Superadmin: every name in all_databases, as ADMIN.
+        # Everyone else: only their grant rows; all_databases is ignored, so it can never
+        # add access.
+        # The list is sorted by name.
 
     def audit(self, user: User | None, action: str, db_name: str | None,
               detail: dict, source: str) -> None: ...
+        # Action names written by AuthService itself: 'bootstrap', 'login', 'login_failed',
+        # 'user_create', 'user_delete', 'password_change', 'grant', 'revoke'.
     def read_audit(self, actor: User, limit: int = 500, db_name: str | None = None) -> list[dict]: ...
+        # Newest first.
 ```
 
-Authorization rule for `grant/revoke/create_user/...`: `actor.is_superadmin` must be True, else `PermissionDenied`. Every `AuthService` method re-checks the actor; the UI hiding a button is not a security control.
+Authorization rule for `create_user`, `delete_user`, `list_users`, `grant`, `revoke` and `read_audit`: `actor.is_superadmin` must be True, else `PermissionDenied`. `change_password` follows its own rule above (superadmin, or the user themselves with their current password). `login`, `bootstrap_superadmin`, `role_for` and `accessible_databases` take no actor. Every `AuthService` method re-checks the actor: it is re-loaded from `app.db` by id on each call, so a deleted user or a stale `User` object is refused. `role_for` and `accessible_databases` re-load their `user` the same way, so a deleted user has no access and a stale `is_superadmin` flag is ignored. The UI hiding a button is not a security control.
+
+After the permission check (so a non-superadmin learns nothing), `delete_user`, `change_password`, `grant` and `revoke` raise `UserNotFound` for an unknown `user_id`, and `create_user` raises `UserExists` for a taken username (compared case-insensitively).
+
+`grant`, `revoke` and `role_for` validate `db_name` with `DB_NAME_RE.fullmatch()` (defined in `db/identifiers.py`, §6.8) and raise `InvalidIdentifier` for a malformed name. The name is also only ever passed as a bound parameter.
 
 > **Note on the "role toggle" from the original idea:** a sidebar toggle that lets the user *pick* Admin or Viewer is a demo, not RBAC. In this spec the role is derived from the logged-in user's grant. For portfolio demos, seed two accounts (`demo_admin`, `demo_viewer`) and show switching between them.
 
@@ -526,7 +566,7 @@ The guard is layer 3 of 5. It is expected that some exotic SQL could slip past a
 ### 6.3 Database Registry — `db/registry.py`
 
 ```python
-DB_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")   # \Z, not $: "abc\n" must not match
+from coalescedb.db.identifiers import DB_NAME_RE   # defined in §6.8, so auth/ can use it too
 
 class DatabaseRegistry:
     def __init__(self, settings: Settings, auth: AuthService) -> None: ...
@@ -656,6 +696,9 @@ Used everywhere a table or column name reaches SQL. There are two cases:
 
 ```python
 IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}\Z")   # \Z, not $: "abc\n" must not match
+DB_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")  # Database names. Lives here, not in
+    # registry.py, because both the registry (§6.3) and AuthService (§6.1) validate with it
+    # and the registry already imports AuthService. Always used with .fullmatch().
 SQLITE_KEYWORDS: frozenset[str]     # Full SQLite keyword list
 
 def to_snake_identifier(raw: str) -> str: ...
@@ -1477,8 +1520,8 @@ def main() -> None:
 
 ### 8.2 Sidebar
 
-- Signed-in user, logout button.
-- Database selector showing only `accessible_databases()`, each with a role badge.
+- Signed-in user, logout button, and a "Change password" option for the signed-in user. It asks for the current password and the new one and calls `change_password(user, user.id, new, current_password=current)` (§6.1).
+- Database selector showing only `accessible_databases(user, all_databases=registry.list_databases())`, each with a role badge. The sidebar always passes the registry's list; it only matters for superadmins.
 - Superadmin: "New database" (name input validated live against `DB_NAME_RE`).
 - Schema browser: expandable tables → columns (type, PK/FK icons), row counts.
 - AI status from `AIStatus` (§6.22): green "AI on · <model> · <n> tok/s", grey "Checking AI speed…", amber "Manual mode" with the reason on hover, or red "Ollama not running" with the fix-it message.
@@ -1710,7 +1753,9 @@ Each item maps to a test in §11.1.
 
 `test_identifiers.py`: `x"; DROP`, `select`, `1abc`, `../x`, the empty string and `"abc\n"` are rejected by `validate_identifier` and `quote_identifier`; `to_snake_identifier` raises for `""`, `" "`, `"!!!"`, `"日本"` and an Arabic header; `quote_existing_identifier` is checked against a real SQLite database with names containing spaces, uppercase, keywords and double quotes.
 
-`test_auth.py`: usernames like `admin'--`, `x; DROP TABLE users`, `a b`, `ab`, `"abc\n"` are rejected; lockout after 5 failures; timing path for unknown users calls verify; last superadmin cannot be deleted; revoked grant blocks the next execute.
+`test_auth.py`: usernames like `admin'--`, `x; DROP TABLE users`, `a b`, `ab`, `"abc\n"` are rejected; lockout after 5 failures; timing path for unknown and malformed usernames calls verify exactly once; last superadmin cannot be deleted; `role_for()` returns `None` right after a revoke and `VIEWER` right after an admin is downgraded; changing your own password needs the current one, and wrong ones count toward the lockout; a superadmin reset clears the lockout; unknown user ids raise `UserNotFound`; malformed database names (incl. `"abc\n"`) are rejected by `grant`, `revoke` and `role_for`; a canary password and a canary typed username never appear in the raw bytes of `app.db` or its WAL file.
+
+`test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute.
 
 `test_registry_paths.py`: `../x`, `x/../../y`, `CON`, `x.db`, uppercase, unicode lookalikes, `"abc\n"` all rejected.
 
@@ -1792,7 +1837,7 @@ In this order, so the first screen answers "what is it and does it work":
 | M2 | `AppStore`, `passwords.py`, `AuthService` (§6.1) | `test_auth.py` passes |
 | M3 | `DatabaseRegistry` (§6.3), `connection.py` + authorizer (§6.4), `introspect.py` (§6.5) | `test_registry_paths.py`, `test_authorizer.py` pass, incl. admin DDL succeeding |
 | M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes |
-| M5 | `Executor` (§6.6), `BackupService` (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many` and `apply_schema`; destructive delete creates a backup |
+| M5 | `Executor` (§6.6), `BackupService` (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many` and `apply_schema`; destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute |
 | M6 | Streamlit UI (§8.1–8.3, §8.5, §8.6): login, first-run setup, sidebar, Write-SQL mode, admin page | Manual: two users, viewer blocked from writes in UI *and* by direct executor call |
 | M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Ask-in-English mode, behind-the-scenes panel | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction |
 | M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized |
