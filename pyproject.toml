@@ -8,8 +8,9 @@ version = "0.1.0"
 description = "Local-first database management GUI for SQLite with role-based access and a local LLM."
 requires-python = ">=3.11,<3.13"
 license = "MIT"
-# Only what the code needs so far (through M1). Later milestones add their own packages.
+# Only what the code needs so far (through M2). Later milestones add their own packages.
 dependencies = [
+    "argon2-cffi",
     "platformdirs",
 ]
 

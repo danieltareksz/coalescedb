@@ -452,7 +452,7 @@ CREATE TABLE audit_log (
 
 **Username rules** (`auth/service.py`): must match `^[A-Za-z][A-Za-z0-9_.-]{2,31}\Z`, checked with `.fullmatch()`. (`\Z`, not `$`: in Python `$` also matches just before a trailing newline, so `"abc\n"` would slip through.) This makes it impossible for a username to contain SQL syntax (no spaces, quotes, semicolons or parentheses). Usernames are *also* only ever passed as bound parameters (`?`), never formatted into SQL. Both protections are required.
 
-**Password rules:** minimum 8 characters, maximum 1024 (Argon2 is deliberately slow, so an unbounded password is a cheap way to stall the app); anything else raises `InvalidPassword`, whose message never contains the password; hashed with Argon2id (`argon2.PasswordHasher()` defaults); `check_needs_rehash` applied on login.
+**Password rules:** minimum 8 characters, maximum 1024 (Argon2 is deliberately slow, so an unbounded password is a cheap way to stall the app); anything else raises `InvalidPassword`, whose message never contains the password. The maximum applies at login too: a password over 1024 characters is refused immediately with the generic `AuthError`, before the user is looked up and without any hashing (see `login` below). Passwords are hashed with Argon2id (`argon2.PasswordHasher()` defaults); `check_needs_rehash` applied on login.
 
 ```python
 # auth/passwords.py
@@ -476,6 +476,10 @@ class AuthService:
         # Raises AuthError (generic "Invalid username or password") or AccountLockedError.
         # Runs a dummy verify when the user doesn't exist to equalize timing.
         # A malformed username gets the same generic AuthError and the same dummy verify.
+        # A password over 1024 characters is refused first of all, with the same generic
+        # AuthError: no user lookup, no verify (so nothing is revealed and no hashing
+        # happens), and therefore no failed_attempts increment. Audited as login_failed
+        # with detail {"reason": "password_too_long"} and no user_id.
         # Increments failed_attempts; locks for login_lockout_s after login_max_failures.
         # While locked: AccountLockedError(retry_after_s=...) even for the right password,
         # and the lock is not extended. Once the lock has expired the counter restarts at 0.

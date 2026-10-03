@@ -306,6 +306,17 @@ def test_known_username_verifies_once(auth, alice, verify_calls):
     assert len(verify_calls) == 2
 
 
+def test_overlong_password_is_refused_without_any_verify(auth, alice, settings, verify_calls):
+    too_long = "p" * 1025
+    for username in ("alice_1", "no_such_user", "a b"):
+        with pytest.raises(AuthError) as excinfo:
+            auth.login(username, too_long)
+        assert type(excinfo.value) is AuthError
+        assert excinfo.value.user_message == AuthError().user_message
+    assert len(verify_calls) == 0  # refused before any lookup or hashing
+    assert lock_state(settings, alice.id) == (0, None)  # the user row was never touched
+
+
 # --- Lockout ---------------------------------------------------------------------------
 
 

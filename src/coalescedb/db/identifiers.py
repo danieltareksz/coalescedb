@@ -16,6 +16,11 @@ MAX_IDENTIFIER_LENGTH = 63
 
 IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}\Z")  # \Z, not $: "abc\n" must not match
 
+# Database names. Lives here, not in registry.py, because both the registry (§6.3) and
+# AuthService (§6.1) validate with it and the registry already imports AuthService.
+# Always used with .fullmatch().
+DB_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")
+
 # Full keyword list from https://www.sqlite.org/lang_keywords.html, stored lowercase.
 SQLITE_KEYWORDS: frozenset[str] = frozenset(
     """

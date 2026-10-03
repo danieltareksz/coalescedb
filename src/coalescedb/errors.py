@@ -62,6 +62,20 @@ class DatabaseExists(CoalesceDBError):
     default_message = "A database with that name already exists."
 
 
+class InvalidPassword(CoalesceDBError):
+    """Too short or too long. The message never includes the password."""
+
+    default_message = "Passwords must be between 8 and 1024 characters long."
+
+
+class UserExists(CoalesceDBError):
+    default_message = "That username is already taken."
+
+
+class UserNotFound(CoalesceDBError):
+    default_message = "That user doesn't exist."
+
+
 class SQLRejected(CoalesceDBError):
     """The SQL guard rejected the query."""
 
