@@ -1,0 +1,11 @@
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+databases/
+models/
+build/
+dist/
+resources/ollama/
