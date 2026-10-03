@@ -9,3 +9,11 @@ models/
 build/
 dist/
 resources/ollama/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+backups/
+traces.jsonl
+benchmark.json
+.vscode/

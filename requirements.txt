@@ -1,0 +1,2 @@
+# Runtime packages, exact versions. Only what the code needs so far (through M1).
+platformdirs==4.12.2

@@ -205,7 +205,8 @@ coalescedb/
     # kw_only: benchmark_cache_path has no default but follows fields that do, which a plain
     # dataclass rejects. Settings is always built with keyword arguments (by load_settings).
 class Settings:
-    data_dir: Path                 # Dev: ./ ; packaged: platformdirs.user_data_dir("CoalesceDB")
+    data_dir: Path                 # Dev: ./ ; packaged: platformdirs.user_data_dir("CoalesceDB");
+                                   # COALESCEDB_DATA_DIR overrides both
     databases_dir: Path            # data_dir / "databases"
     backups_dir: Path              # data_dir / "backups"
     app_db_path: Path              # data_dir / "app.db"   (users, grants, audit — NOT in databases_dir)
@@ -213,8 +214,9 @@ class Settings:
 
     ollama_host: str = "http://127.0.0.1:11434"
     # There is no single "ollama_model" setting. After M15, the model in use is decided at
-    # runtime by the ladder in §6.22 and stored in AIStatus.active_model. Before M15
-    # (and whenever active_model is unset), callers use Settings.default_model.
+    # runtime by the ladder in §6.22 and stored in AIStatus.active_model. Only until M15
+    # exists do callers use Settings.default_model. From M15 on there is no fallback: if
+    # active_model is None, complete() raises LLMUnavailable (§6.10).
     ollama_num_ctx: int = 8192     # Must be set explicitly; Ollama's default context is much smaller
     ollama_timeout_s: float = 120.0
     llm_temperature: float = 0.0
@@ -258,15 +260,23 @@ class Settings:
 
     @property
     def default_model(self) -> str:
-        # Interim source of truth until M15 sets AIStatus.active_model. M7 OllamaClient
-        # and M10 evals (`--model` omitted) use this. After M15, complete() still falls
-        # back here if active_model is None.
+        # Interim source of truth, used by M7 OllamaClient only until M15 (the speed test,
+        # §6.22) exists. From M15 on, complete() never falls back here: if
+        # AIStatus.active_model is None it raises LLMUnavailable with AIStatus.reason as
+        # the message (§6.10). Evals (§11.2) keep using this as the default for `--model`,
+        # since they choose their model explicitly.
         return self.model_ladder[0]
 
 def load_settings() -> Settings: ...
     # Order: defaults → env vars prefixed COALESCEDB_ (e.g. COALESCEDB_OLLAMA_HOST) → frozen.
     # Creates directories with mode 0o700 where the OS supports it.
     # Detects packaged mode via getattr(sys, "frozen", False).
+    # COALESCEDB_DATA_DIR, when set, replaces data_dir in both dev and packaged mode (tests
+    # use it to avoid writing into the repo). The five paths derived from data_dir
+    # (databases_dir, backups_dir, app_db_path, traces_path, benchmark_cache_path) always
+    # follow it and cannot be overridden one by one.
+    # A value that can't be converted to the field's type raises ValueError naming the
+    # variable (never repeating the value). An empty model_ladder raises ValueError.
 ```
 
 ---
@@ -710,8 +720,11 @@ class OllamaClient:
     def __init__(self, settings: Settings) -> None: ...
     # complete() / complete_json(): `model` is optional. Resolve in this order:
     #   1. the explicit `model` argument (evals pass --model this way);
-    #   2. AIStatus.active_model, if resolve_ai_status has already set it (M15+);
-    #   3. settings.default_model (first entry of model_ladder).
+    #   2. AIStatus.active_model, as set by resolve_ai_status (M15+);
+    #   3. M7–M14 only, before the speed test exists: settings.default_model (first entry
+    #      of model_ladder). M15 removes this step. From then on, if no explicit `model`
+    #      was passed and AIStatus.active_model is None, raise LLMUnavailable with
+    #      AIStatus.reason as the message. There is no fallback to default_model.
     # complete(): POST {host}/api/chat, stream=False,
     #   options={"temperature": s.llm_temperature, "num_ctx": s.ollama_num_ctx, "num_predict": max_tokens}
     # complete_json(): same, plus "format": schema.model_json_schema().

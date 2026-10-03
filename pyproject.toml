@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coalescedb"
+version = "0.1.0"
+description = "Local-first database management GUI for SQLite with role-based access and a local LLM."
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+# Only what the code needs so far (through M1). Later milestones add their own packages.
+dependencies = [
+    "platformdirs",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# UP042 wants enum.StrEnum; PROJECT_SPEC.md §5 defines Role/StatementKind as (str, Enum).
+ignore = ["UP042"]

@@ -1,0 +1,5 @@
+# Development tools, exact versions. pyinstaller, bandit and pip-audit join in M11/M12.
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.16.10
