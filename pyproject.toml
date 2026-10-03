@@ -28,3 +28,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "B", "UP"]
 # UP042 wants enum.StrEnum; PROJECT_SPEC.md §5 defines Role/StatementKind as (str, Enum).
 ignore = ["UP042"]
+
+[tool.ruff.lint.isort]
+# Without this, ruff decides per submodule by looking for the folder under src/, so tests
+# written before a package exists (tests-first) get a different import order than after.
+known-first-party = ["coalescedb"]
