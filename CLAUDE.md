@@ -6,8 +6,16 @@
   (e.g. sqlglot class names), STOP and tell me. Do not improvise.
 - Never weaken, skip, or delete a security check or test to make something pass.
   If a test in tests/security/ seems wrong, stop and explain why.
-- Never put values or identifiers into SQL with f-strings or string concatenation.
-  Values use ? placeholders; identifiers go through quote_identifier().
+- Never put values or identifiers into SQL with f-strings or string concatenation
+  except as specified below.
+  New identifiers created by the app (PDF extraction, spreadsheet import) must be
+  validated with `to_snake_identifier()` and `quote_identifier()`. Pre-existing
+  schema identifiers (imported SQLite files, SQL dump tables/columns) must pass
+  through `quote_existing_identifier(name, known)`.
+  Values in user-facing DML queries must ALWAYS be passed as bound `?` parameters.
+  For DDL generation in `compile_ddl` (column defaults and `CHECK (col IN (...))`
+  lists), values must be safely escaped as SQL literals by doubling single quotes
+  or rendered via `sqlglot` expressions. SQLite cannot bind `?` in DDL.
 - Never use exec, eval, or pickle.
 - Never log or trace passwords, document text, or query results.
 - Do not add dependencies that aren't in the spec without asking me.
