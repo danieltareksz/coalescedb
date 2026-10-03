@@ -37,6 +37,7 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 | PDF text | `pypdf` (BSD) | **Not PyMuPDF**: PyMuPDF is AGPL, which conflicts with distributing a closed executable |
 | XLSX / CSV | `pandas` + `openpyxl` | `read_only=True`, `data_only=True` |
 | App paths | `platformdirs` | User-writable data dir in packaged mode |
+| System info | `psutil` (BSD) | Free/total RAM and CPU details for the benchmark (§6.22) |
 | Desktop window | `pywebview` (optional) | Falls back to opening the default browser |
 | Packaging | PyInstaller (`--onedir`) | `--onefile` is slow to start with Streamlit |
 | Tests | `pytest`, `pytest-cov` | |
@@ -50,7 +51,7 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 | Statistics & forecasting | `statsmodels`, `scipy` | OLS with confidence intervals, Holt-Winters exponential smoothing |
 | Fine-tuning (separate env, not shipped) | `unsloth` or `transformers` + `peft` + `trl` + `bitsandbytes`; `llama.cpp` for GGUF conversion | Lives in `training/` with its own `requirements-train.txt`; runs on a cloud GPU (§16) |
 
-`requirements.txt` pins exact versions. `requirements-dev.txt` adds `pytest`, `pytest-cov`, `ruff`, `pyinstaller`. Optional extras in `pyproject.toml`: `live-import`.
+`requirements.txt` pins exact versions. `requirements-dev.txt` adds `pytest`, `pytest-cov`, `ruff`, `pyinstaller`, `bandit`, `pip-audit`. Optional extras in `pyproject.toml`: `live-import`.
 
 **Size note:** scikit-learn, statsmodels and scipy add roughly 150–250 MB to the packaged app. That is acceptable for a desktop tool, but the README should state the download size.
 
@@ -62,7 +63,7 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 
 ```
 coalescedb/
-├── app.py                        # Streamlit entry point (thin: routing + page calls only)
+├── app.py                        # Two lines: `from coalescedb.ui.main import main; main()` (§9.3)
 ├── launcher.py                   # Executable entry point: sidecar, server, window (§9)
 ├── pyproject.toml
 ├── requirements.txt
@@ -127,6 +128,7 @@ coalescedb/
 │       │   └── tracing.py        # Local JSONL traces: latency, tokens (§6.17)
 │       └── ui/
 │           ├── __init__.py
+│           ├── main.py           # Page routing (§8.1); imported by app.py
 │           ├── state.py          # Typed wrapper around st.session_state
 │           ├── login.py          # Login + first-run admin setup page
 │           ├── sidebar.py        # DB picker, schema browser, user badge
@@ -178,7 +180,7 @@ coalescedb/
 │   ├── coalescedb.spec           # PyInstaller spec (§9.3)
 │   ├── fetch_ollama.py           # Downloads per-OS Ollama binary into resources/ (§9.2)
 │   └── resources/
-│       └── bin/                  # Bundled ollama binary (git-ignored)
+│       └── ollama/               # Bundled Ollama release, extracted (git-ignored)
 ├── assets/
 │   ├── architecture.md           # Mermaid diagram
 │   └── demo.gif
@@ -189,7 +191,7 @@ coalescedb/
 ├── docker-compose.yml            # Optional: app + ollama containers for reviewers
 ├── Dockerfile
 ├── .env.example
-├── .gitignore                    # databases/, *.db, models, build/, dist/, resources/bin/
+├── .gitignore                    # databases/, *.db, models, build/, dist/, resources/ollama/
 ├── LICENSE                       # MIT
 └── README.md
 ```
@@ -208,12 +210,13 @@ class Settings:
     traces_path: Path              # data_dir / "traces.jsonl"
 
     ollama_host: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen2.5-coder:1.5b-instruct-q4_K_M"
+    # There is no single "ollama_model" setting. The model in use is decided at runtime
+    # by the ladder in §6.22 and stored in AIStatus.active_model.
     ollama_num_ctx: int = 8192     # Must be set explicitly; Ollama's default context is much smaller
     ollama_timeout_s: float = 120.0
     llm_temperature: float = 0.0
 
-    max_result_rows: int = 1000
+    max_result_rows: int = 1000              # Default on-screen cap (Query page)
     query_timeout_s: float = 10.0
     max_upload_mb: int = 25
     max_pdf_pages: int = 60
@@ -224,9 +227,13 @@ class Settings:
     backups_to_keep: int = 20
 
     # Model ladder & benchmark (§6.22)
-    model_ladder: tuple[str, ...] = ("coalescedb-sql:1.5b", "coalescedb-sql:0.5b")
-        # Fine-tuned models from §16 if installed; otherwise falls back to
-        # ("qwen2.5-coder:1.5b-instruct-q4_K_M", "qwen2.5-coder:0.5b-instruct-q4_K_M"). Both are Q4_K_M quantized.
+    model_ladder: tuple[str, ...] = ("qwen2.5-coder:1.5b-instruct-q4_K_M",
+                                     "qwen2.5-coder:0.5b-instruct-q4_K_M")
+        # Ordered list tried by §6.22, biggest first. Both are 4-bit (Q4_K_M).
+    finetuned_ladder: tuple[str, ...] = ()
+        # Empty until M20 ships fine-tuned models, e.g. ("coalescedb-sql:1.5b", "coalescedb-sql:0.5b").
+        # When non-empty, each fine-tuned model is tried in place of the stock model of the same
+        # size; if its download or checksum fails, the stock model is used instead.
     benchmark_min_gen_tps: float = 20.0      # Generation speed required to enable AI
     benchmark_min_prompt_tps: float = 150.0  # Prompt-reading speed required for PDF import
     benchmark_runs: int = 3                  # Median of N runs after one warm-up
@@ -362,15 +369,21 @@ class BenchmarkResult:
     prompt_tps: float            # Median prompt-processing tokens/s
     runs: int
     measured_at: datetime
-    machine_fingerprint: str     # Hash of CPU model, RAM size, GPU name, OS, Ollama version, model digest
+    machine_fingerprint: str     # Hash of CPU model, total RAM, OS, Ollama version, model digest
+
+AIState = Literal["checking", "needs_download_consent", "downloading",
+                  "ready", "disabled", "ollama_unavailable"]
 
 @dataclass(frozen=True)
 class AIStatus:
-    enabled: bool
-    active_model: str | None
+    state: AIState
+    enabled: bool                # True only when state == "ready"
+    active_model: str | None     # The ONLY source of truth for which model the app calls
     pdf_import_enabled: bool     # False if prompt_tps below threshold even when AI is on
     reason: str                  # Human-readable, shown in the sidebar
     results: list[BenchmarkResult]
+    pending_downloads: list[tuple[str, int]]   # (model name, size in bytes) awaiting consent
+    download_progress: tuple[int, int] | None  # (bytes done, total) while downloading
 ```
 
 ---
@@ -478,12 +491,13 @@ def validate(sql: str, role: Role, known_tables: set[str]) -> GuardResult: ...
    - `exp.Select`, `exp.Union`, `exp.Intersect`, `exp.Except` → `SELECT` (CTEs appear as the `with` arg of these and are fine)
    - `exp.Insert` → `INSERT`; `exp.Update` → `UPDATE`; `exp.Delete` → `DELETE`
    - `exp.Create` with `kind` `TABLE` / `INDEX` / `VIEW` → corresponding kind; any other `kind` (e.g. `TRIGGER`) → reject
+   - **Extra CREATE checks** (sqlglot parses these as an ordinary `TABLE`, so `kind` alone is not enough): reject `CREATE TEMP`/`TEMPORARY`, `CREATE VIRTUAL TABLE ... USING`, and tables declared `STRICT` or `WITHOUT ROWID`. Detect them from the parsed node's properties where sqlglot represents them, and otherwise from sqlglot's token stream for the statement (keyword tokens only, never a raw substring search, so a column named `strict_mode` is fine). `STRICT` is rejected because sqlglot drops it when re-rendering (step 10), so the table would silently be created without it. Exact sqlglot class names change between versions; the tests in §11.1 are the contract.
    - `exp.Alter` → `ALTER_TABLE`; `exp.Drop` with kind `TABLE`/`INDEX`/`VIEW` → `DROP`
    - **Everything else rejects**, explicitly including `exp.Command` (sqlglot's fallback for unparsed statements), `exp.Pragma`, ATTACH/DETACH, `exp.Transaction`, `exp.Commit`, `exp.Rollback`, VACUUM, REINDEX, `exp.Set`.
 5. **Role check:** `kind in ROLE_PERMISSIONS[role]`, else reject with "Viewer accounts can only run SELECT queries".
 6. **Deep walk for forbidden nodes** (all roles), using `root.walk()`: reject if any node is a write expression inside a statement whose root is `SELECT` (e.g. a data-modifying CTE), or if any function call name (lower-cased, including `exp.Anonymous`) is in `FORBIDDEN_FUNCTIONS = {"load_extension", "readfile", "writefile", "edit", "fts3_tokenizer", "sqlite_compileoption_get"}`.
-7. **Protected tables:** reject any reference to tables named `sqlite_*` (except reading `sqlite_master`/`sqlite_schema` for SELECT) or prefixed `_app_` (reserved for internal metadata).
-8. **Table existence (warning only):** tables not in `known_tables` are added to `reasons` as warnings for non-CREATE statements; SQLite will produce the real error.
+7. **Protected tables:** reject any reference to tables named `sqlite_*` (except reading `sqlite_master`/`sqlite_schema` for SELECT) or prefixed `_app_` (reserved). This is what stops `UPDATE sqlite_master ...`; the admin authorizer can't, because SQLite records every legitimate CREATE/DROP/ALTER as a write to `sqlite_master` (§6.4).
+8. **Table existence (warning only):** tables not in `known_tables` are added to `reasons` as warnings for non-CREATE statements; SQLite will produce the real error. The guard does not check columns. (Self-correction in §6.11 uses SQLite's own error instead.)
 9. **Destructiveness:** set `is_destructive=True` for `DROP`; `DELETE`/`UPDATE` with no `WHERE`; `ALTER TABLE ... DROP COLUMN` / `RENAME`.
 10. **Normalize:** `normalized_sql = root.sql(dialect="sqlite")`. **The executor runs `normalized_sql`, not the original string.**
 
@@ -509,7 +523,10 @@ class DatabaseRegistry:
     def rename(self, actor: User, old: str, new: str) -> None: ...   # updates grants atomically
     def import_file(self, actor: User, src: Path, db_name: str) -> Path: ...
         # Accepts an existing .sqlite/.db; verifies header "SQLite format 3\0"; runs
-        # PRAGMA integrity_check on a copy before placing it.
+        # PRAGMA integrity_check on a copy before placing it. Existing table/column names are
+        # kept as they are (e.g. "Order", "CustomerId", "First Name"); the app reads them with
+        # quote_existing_identifier (§6.8). The file is rejected if it contains triggers or
+        # virtual tables (listed by name in the error), since the authorizer blocks creating them.
 ```
 
 ### 6.4 Role-Scoped Connections — `db/connection.py`
@@ -524,12 +541,13 @@ def open_connection(path: Path, role: Role, timeout_s: float) -> Iterator[sqlite
 Requirements:
 
 - **Viewer:** open with URI `f"file:{path.as_posix()}?mode=ro"` and `uri=True`, then `PRAGMA query_only = ON`. The file handle itself is read-only.
-- **Admin:** normal read-write connection, `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`.
+- **Admin:** normal read-write connection, `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`. These PRAGMAs are run **before** the authorizer is installed, because the authorizer then denies all PRAGMAs.
 - **Both:** `conn.enable_load_extension(False)` where available.
 - **Authorizer** via `conn.set_authorizer(callback)`:
   - Viewer allowlist: `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION` (only if function name not in `FORBIDDEN_FUNCTIONS`), `SQLITE_RECURSIVE`. Everything else → `SQLITE_DENY`.
-  - Admin: deny `SQLITE_ATTACH`, `SQLITE_DETACH`, `SQLITE_PRAGMA` (see note), `SQLITE_CREATE_TRIGGER`, `SQLITE_CREATE_TEMP_*`, forbidden functions, and any write to `sqlite_*` or `_app_*` tables. Allow the rest.
-  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that allows read-only PRAGMAs (`table_info`, `foreign_key_list`, `index_list`) and is never exposed to user SQL.
+  - Admin: deny `SQLITE_ATTACH`, `SQLITE_DETACH`, `SQLITE_PRAGMA`, `SQLITE_CREATE_TRIGGER`, all `SQLITE_CREATE_TEMP_*` codes, `SQLITE_CREATE_VTABLE`, `SQLITE_DROP_VTABLE`, forbidden functions, and any write to `_app_*` tables. Allow the rest.
+  - **Do not deny writes to `sqlite_*` tables for admins.** SQLite reports every `CREATE`, `DROP` and `ALTER` as a write to `sqlite_master`, so that rule blocks all schema changes. Direct tampering (`UPDATE sqlite_master`, `PRAGMA writable_schema`) is already stopped by guard step 7 and the PRAGMA deny. `test_authorizer.py` must confirm that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` succeed for admins.
+  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that allows read-only PRAGMAs (`table_info`, `foreign_key_list`, `index_list`) and is never exposed to user SQL. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
 - **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`.
 
 ### 6.5 Introspection — `db/introspect.py`
@@ -546,9 +564,12 @@ def sample_rows(path: Path, table: str, n: int = 3) -> list[dict]: ...
 
 ### 6.6 Executor — `db/executor.py`
 
-The only function in the app that runs user-facing SQL.
+The only class in the app that runs SQL against user databases. Every feature (manual SQL, English questions, ingestion, imports, export, analytics) goes through it, so the role checks, guard and audit log apply everywhere.
 
 ```python
+Source = Literal["manual_sql", "nl", "ingest", "sql_import", "live_import",
+                 "export", "analyze", "system"]
+
 class Executor:
     def __init__(self, settings: Settings, registry: DatabaseRegistry,
                  auth: AuthService, backups: BackupService) -> None: ...
@@ -556,20 +577,35 @@ class Executor:
     def preview(self, session: Session, sql: str) -> GuardResult: ...
         # Runs the guard only. Used to render the review drawer.
 
-    def execute(self, session: Session, sql: str, *, source: Literal["manual_sql","nl"],
-                confirmed: bool = False, destructive_confirm_text: str | None = None
-                ) -> QueryResult: ...
+    def execute(self, session: Session, sql: str, *, source: Source,
+                params: Sequence[Any] | None = None,
+                max_rows: int | None = None,
+                confirmed: bool = False,
+                destructive_confirm_text: str | None = None) -> QueryResult: ...
+
+    def execute_many(self, session: Session, sql: str,
+                     rows: Iterable[Sequence[Any]], *, source: Source,
+                     confirmed: bool, batch_size: int = 1000) -> int: ...
+        # For parameterized bulk INSERTs (§6.14, §6.15, §6.19, §6.20). The SQL is guarded
+        # once and must be a single INSERT ... VALUES with only "?" placeholders as values.
+        # All batches run in ONE transaction; any failure rolls back everything. Returns row count.
+
+    def apply_schema(self, session: Session, ddl: list[str], *, source: Source,
+                     confirmed: bool) -> None: ...
+        # Several DDL statements in ONE transaction (§6.13, §6.15, §6.19). Each statement is
+        # guarded individually; one rejection rejects all. Snapshot first if the DB has tables.
 ```
 
-`execute` contract:
+Contract for all three methods:
 
 1. Re-resolve role from `auth.role_for(session.user, session.db_name)`. **Do not trust `session.role`.** None → `PermissionDenied`.
-2. `guard = validate(sql, role, known_tables)`; if not allowed → audit `query_rejected`, raise `SQLRejected(guard.reasons)`.
-3. If `guard.kind != SELECT` and not `confirmed` → raise `PermissionDenied("confirmation required")`. (UI shows review drawer.)
+2. Guard every statement with `validate(sql, role, known_tables)`; if any is not allowed → audit `query_rejected`, raise `SQLRejected(guard.reasons)`.
+3. Any write without `confirmed=True` → `PermissionDenied("confirmation required")`. UI flows pass `confirmed=True` only after the user clicks the confirm button on a screen showing what will be written.
 4. If `guard.is_destructive`: `destructive_confirm_text` must equal the database name; then `backups.snapshot(path, reason=...)` before executing.
-5. Open connection via §6.4 with the resolved role; execute `guard.normalized_sql` with **no parameter formatting**; for SELECT use `fetchmany(max_result_rows + 1)` to detect truncation.
-6. Writes run inside `BEGIN IMMEDIATE ... COMMIT`, rolled back on any exception.
-7. Audit `query` with SQL, kind, row_count, elapsed, source.
+5. Open a connection via §6.4 with the resolved role and run `guard.normalized_sql`. **Values are only ever passed through `params` / `rows` as bound parameters** — never formatted into the SQL string.
+6. SELECT row cap: `max_rows` if given, else `max_result_rows`, and never more than `max_export_rows`. Use `fetchmany(cap + 1)` to set `truncated`.
+7. Writes run inside `BEGIN IMMEDIATE ... COMMIT`, rolled back on any exception.
+8. Audit `query` (or `export` / `ingest` / `sql_import` / `live_import` per `source`) with SQL, kind, row_count, elapsed, source. Parameter values are never written to the audit log.
 
 ### 6.7 Backups — `db/backup.py`
 
@@ -585,7 +621,10 @@ class BackupService:
 
 ### 6.8 Identifiers — `db/identifiers.py`
 
-Used everywhere a table or column name reaches SQL (ingestion, schema designer, UI table browser).
+Used everywhere a table or column name reaches SQL. There are two cases:
+
+- **New names the app creates** (document ingestion, schema designer, spreadsheet import): normalized with `to_snake_identifier` and checked by `validate_identifier`, so they are always simple lowercase names.
+- **Names that already exist in a database** (an imported `.db` file with tables like `Order` or columns like `CustomerId`): kept exactly as they are, and quoted with `quote_existing_identifier`, which only accepts a name the app itself just read from that database's schema.
 
 ```python
 IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -595,11 +634,16 @@ def to_snake_identifier(raw: str) -> str: ...
     # "Due Date (EST)" → "due_date_est"; strips accents; collapses underscores;
     # prefixes "c_" if it starts with a digit; appends "_col" if it's a keyword; truncates to 63.
 def validate_identifier(name: str) -> str: ...     # raise InvalidIdentifier if not IDENT_RE or keyword
-def quote_identifier(name: str) -> str: ...        # validate, then return f'"{name}"'
+def quote_identifier(name: str) -> str: ...        # For NEW names: validate, then return f'"{name}"'
+def quote_existing_identifier(name: str, known: set[str]) -> str: ...
+    # For EXISTING names. `known` must come from introspection of the target database
+    # (§6.5) in the same operation. Raises InvalidIdentifier if name not in known, or if it
+    # contains a NUL byte. Returns '"' + name.replace('"', '""') + '"' (standard SQL escaping).
+    # Never called with text typed by a user or produced by the model.
 def dedupe(names: list[str]) -> list[str]: ...     # "title","title" → "title","title_2"
 ```
 
-Values are always bound with `?` placeholders. Identifiers cannot be bound, so they must pass `validate_identifier` and be quoted.
+Values are always bound with `?` placeholders. Identifiers cannot be bound, so they must go through one of the two quoting functions. `test_identifiers.py` covers both, including existing names with spaces, uppercase letters, keywords (`Order`) and embedded double quotes.
 
 ### 6.9 Untrusted Text — `security/sanitize.py`
 
@@ -653,7 +697,11 @@ Flow:
 
 1. Build prompt from §7.1 with `schema_ddl()`, 3 `sample_rows` per table, the role (so a viewer's model is told SELECT only), and the question wrapped via `wrap_untrusted(question, "QUESTION")`.
 2. `complete()` → `strip_code_fences()` → `validate()`.
-3. If guard rejects due to **parse error or unknown table/column**, do one self-correction round: feed back the guard reason (or, for SELECT only, the SQLite error from a dry run using `EXPLAIN` on a viewer connection) and regenerate. Never retry to get around a *permission* rejection.
+3. **One self-correction round**, triggered by either:
+   - the guard rejecting with a **parse error** (`SQLParseError`), or
+   - the guard allowing the statement but a **dry run** failing: run `EXPLAIN <normalized_sql>` on a connection opened with the user's role (§6.4). `EXPLAIN` compiles the statement without running it, so it reports `no such table` / `no such column` / type errors without changing anything.
+
+   The exact error text is fed back with the §7.1 self-correction message and the SQL is regenerated once. **Never retry after a permission rejection** (role check, protected tables, forbidden functions, extra CREATE checks), so the model can't be used to search for a way around the rules.
 4. Return `SQLGeneration`. This function **never executes** anything; the UI passes the result to `Executor`.
 
 ### 6.12 Readers & Chunking — `ingest/readers.py`, `ingest/chunking.py`
@@ -689,17 +737,28 @@ class ColumnSpec(BaseModel):
     name: str                      # Validated/normalized via to_snake_identifier
     type: ColumnType
     nullable: bool = True
+    default: str | int | float | None = None     # Literal only; compiled as an escaped SQL literal
+    allowed_values: list[str] | None = None      # ENUM → CHECK (col IN (...)), values escaped
     description: str | None = None
 
 class ForeignKeySpec(BaseModel):
-    column: str
+    columns: list[str]                           # Multi-column FKs supported
     ref_table: str
-    ref_column: str = "id"
+    ref_columns: list[str] = ["id"]
+    on_delete: Literal["NO ACTION", "CASCADE", "SET NULL", "RESTRICT"] = "NO ACTION"
+
+class IndexSpec(BaseModel):
+    name: str
+    columns: list[str]
+    unique: bool = False
 
 class TableSpec(BaseModel):
     name: str
-    columns: list[ColumnSpec] = Field(min_length=1, max_length=40)
+    columns: list[ColumnSpec] = Field(min_length=1, max_length=200)
+    primary_key: list[str] | None = None         # None → compile_ddl adds "id INTEGER PRIMARY KEY"
+    unique_constraints: list[list[str]] = []
     foreign_keys: list[ForeignKeySpec] = []
+    indexes: list[IndexSpec] = []
 
 class SchemaProposal(BaseModel):
     tables: list[TableSpec] = Field(min_length=1, max_length=12)
@@ -707,16 +766,23 @@ class SchemaProposal(BaseModel):
 
 def propose_schema(llm: LLMClient, pages: list[str], user_goal: str) -> SchemaProposal: ...
     # Uses §7.2 on the most relevant chunks. Post-processes: normalizes all identifiers,
-    # dedupes, adds "id INTEGER PRIMARY KEY" to every table (model never defines PKs),
-    # drops FKs pointing at unknown tables, orders tables so referenced ones come first.
+    # dedupes, leaves primary_key=None (model never defines PKs), forces every FK to
+    # single-column with on_delete="CASCADE", drops FKs pointing at unknown tables,
+    # and clears unique_constraints/indexes/defaults (the §7.2 JSON schema doesn't offer them).
 
-def compile_ddl(proposal: SchemaProposal) -> list[str]: ...
-    # Deterministic. DATE → TEXT with CHECK (col IS NULL OR col GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
-    # BOOLEAN → INTEGER CHECK (col IN (0,1)). FKs with ON DELETE CASCADE.
+def compile_ddl(proposal: SchemaProposal, *, origin: Literal["designed", "imported"]) -> list[str]: ...
+    # Deterministic.
+    # Both: DATE → TEXT with CHECK (col IS NULL OR col GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    #   BOOLEAN → INTEGER CHECK (col IN (0,1)); string literals escaped by doubling single quotes;
+    #   tables ordered so referenced tables come first; one CREATE INDEX per IndexSpec.
+    # "designed": primary_key=None → adds "id INTEGER PRIMARY KEY".
+    # "imported": keeps the source's primary key, unique constraints, indexes and FK actions
+    #   exactly; a table with no primary key in the source gets none here either.
+    #   A single INTEGER primary-key column becomes "INTEGER PRIMARY KEY".
     # Every statement is passed through validate(..., Role.ADMIN) as a self-check.
 
 def apply_schema(executor: Executor, session: Session, ddl: list[str]) -> None: ...
-    # Executes in one transaction after UI confirmation; snapshot first if DB non-empty.
+    # Calls Executor.apply_schema(..., source="ingest", confirmed=True) after the UI confirm click.
 ```
 
 UI: proposal is rendered as an editable table (rename/retype/remove columns, remove tables) before `compile_ddl`, with the compiled DDL shown underneath.
@@ -741,9 +807,9 @@ def extract_rows(llm: LLMClient, pages: list[str], table: TableInfo,
 
 def insert_rows(executor: Executor, session: Session, table: str,
                 rows: list[dict], fk_values: dict[str, int]) -> int: ...
-    # Admin only. INSERT INTO "table" ("c1","c2") VALUES (?,?) via executemany,
-    # identifiers from validate_identifier, one transaction, returns count.
-    # Goes through connection-level authorizer; audited with source="ingest".
+    # Admin only. Builds INSERT INTO "table" ("c1","c2") VALUES (?,?) with
+    # quote_existing_identifier against the table's introspected columns, then calls
+    # Executor.execute_many(..., source="ingest", confirmed=True). One transaction; returns count.
 ```
 
 Flow in UI: upload → choose target DB/tables (or "create new database from this document" → §6.13 first) → extraction runs with progress per chunk → rows shown in `st.data_editor` for correction/deletion → **Insert** button → `insert_rows`.
@@ -815,7 +881,7 @@ Every action in this table is audited (§6.1) with action names `export`, `analy
 
 ### 6.19 SQL Dump Import — `ingest/sql_import.py`
 
-Converts `.sql` dump files from other databases into a **new** SQLite database. **The dump's SQL text is never executed.** It is parsed; table definitions are rebuilt as `TableSpec`s and compiled by `compile_ddl` (§6.13); row values are extracted as literals and inserted with bound parameters. This makes a malicious dump (one containing `DROP`, `ATTACH`, triggers, etc.) harmless.
+Converts `.sql` dump files from other databases into a **new** SQLite database. **The dump's SQL text is never executed.** It is parsed; table definitions are rebuilt as `TableSpec`s (keeping the source's primary keys, unique constraints, indexes, ENUM values and multi-column foreign keys) and compiled by `compile_ddl(..., origin="imported")` (§6.13); row values are extracted as literals and inserted with bound parameters. This makes a malicious dump (one containing `DROP`, `ATTACH`, triggers, etc.) harmless.
 
 ```python
 Dialect = Literal["postgres", "mysql", "tsql", "oracle", "sqlite"]   # sqlglot dialect names
@@ -864,15 +930,17 @@ def run_sql_import(executor: Executor, session: Session, path: Path, dialect: Di
 
 | Source types | SQLite `ColumnType` | Notes |
 |---|---|---|
-| int, integer, bigint, smallint, tinyint, serial, bigserial, identity | INTEGER | A single-column integer PK becomes `INTEGER PRIMARY KEY` |
+| int, integer, bigint, smallint, tinyint, serial, bigserial, identity | INTEGER | A single-column integer PK becomes `INTEGER PRIMARY KEY`; composite PKs are kept as `PRIMARY KEY (a, b)` |
 | decimal/numeric/money | REAL | Warning if precision > 15 digits; option "keep exact decimals" stores TEXT |
 | float, double, real | REAL | |
-| char, varchar, varchar2, nvarchar, text, clob, uuid, json, jsonb, xml, enum, set, arrays | TEXT | ENUM gets a `CHECK (col IN (...))`; arrays/geometry produce a warning |
+| char, varchar, varchar2, nvarchar, text, clob, uuid, json, jsonb, xml, enum, set, arrays | TEXT | ENUM values go into `ColumnSpec.allowed_values` → `CHECK (col IN (...))`; arrays/geometry produce a warning |
 | date | DATE | |
 | timestamp, datetime, datetime2, timestamptz, time | DATETIME | Normalized to ISO 8601 |
 | boolean, bit(1) | BOOLEAN | |
 | blob, bytea, binary, varbinary, raw | BLOB | |
 | anything else | TEXT | Warning |
+
+Identifiers from the dump keep their original spelling (quoted with `quote_existing_identifier` against the planned specs), so queries written for the source database still work. Things SQLite can't represent (sequences, partial/expression indexes, deferred constraints, check constraints with functions) are listed in `warnings`.
 
 Size limit: `max_sql_dump_mb`. Progress is reported per 10,000 rows. The import report is shown before and after (planned tables first, then results).
 
@@ -938,21 +1006,29 @@ def machine_fingerprint(client: OllamaClient, model: str) -> str: ...
 
 **Benchmark procedure** (`benchmark_model`):
 1. One warm-up request to load the model (not measured).
-2. `benchmark_runs` requests to `POST /api/generate`, `stream=False`, using a fixed, realistic prompt: a §7.1 text-to-SQL prompt over a bundled demo schema (about 400 tokens), with `options = {"num_predict": 64, "temperature": 0, "seed": 0, "num_ctx": settings.ollama_num_ctx}`. A trivial prompt like `SELECT 1;` would overstate real speed.
+2. `benchmark_runs` requests to `POST /api/generate`, `stream=False`, using a realistic prompt: a §7.1 text-to-SQL prompt over a bundled demo schema (about 400 tokens), with `options = {"num_predict": 64, "temperature": 0, "seed": 0, "num_ctx": settings.ollama_num_ctx}`. A trivial prompt like `SELECT 1;` would overstate real speed.
+   - **Defeat Ollama's prompt cache.** Ollama reuses the processed prefix of a prompt it has already seen, so repeating the same prompt measures the cache, not the computer (one test machine showed ~400 tok/s on the first run and ~13,000 on repeats). Every request, including the warm-up, starts with a different random line **at the very beginning** of the prompt (e.g. `-- run 7f3a9c2e` from `secrets.token_hex(4)`). A random value at the end doesn't help, because the cache matches from the start of the prompt.
+   - `test_benchmark.py` asserts that no two requests in one benchmark share their first line.
 3. From each response: `gen_tps = eval_count / (eval_duration / 1e9)` and `prompt_tps = prompt_eval_count / (prompt_eval_duration / 1e9)`, guarding against zero durations. Report the median of each.
 
 **Fallback ladder** (`resolve_ai_status`):
 1. `ai_mode_override == "force_off"` → AI disabled, reason "Turned off in settings".
 2. If `benchmark.json` has a result for this `machine_fingerprint` that is under 30 days old and `force` is False, reuse it.
-3. Otherwise, for each model in `model_ladder` (1.5B first, then 0.5B):
-   - Skip it if free RAM is below 1.5× the model's file size (reason recorded).
-   - Make sure it is installed (§9.2). On first run this is a download, so the UI asks for consent and shows its size first.
+3. Otherwise, for each size in the ladder (1.5B first, then 0.5B), using the fine-tuned model from `finetuned_ladder` if it is configured and installed, else the stock model from `model_ladder`:
+   - Skip it if free RAM (`psutil.virtual_memory().available`) is below 1.5× the model's file size (reason recorded).
+   - If it isn't installed: set `state="needs_download_consent"`, add it to `pending_downloads` with its size, and **stop the background check there**. The worker thread never tries to show anything itself.
    - Benchmark it. If `gen_tps ≥ benchmark_min_gen_tps`, select it and stop. Before trying the next, smaller model, unload this one (`keep_alive: 0`) to free memory.
 4. If no model passes → AI disabled. Reason example: "AI features need 20 tokens/s; this computer reached 9.4 with the smallest model. Manual SQL, import, export, charts and analytics still work."
 5. `pdf_import_enabled = enabled and prompt_tps ≥ benchmark_min_prompt_tps and active_model allows it` (see feature gating below).
 6. `force_on` skips the threshold but still benchmarks, and shows an amber "AI may be slow on this computer" badge.
 
-**When it runs:** in a background thread *after* the window opens, so startup is never blocked by a model download. While it runs, the sidebar shows "Checking AI speed…" and all non-AI features are usable. Superadmins have a **Re-run benchmark** button on the Admin page.
+**When it runs:** in a background thread *after* the window opens, so startup is never blocked. While it runs, the sidebar shows "Checking AI speed…" and all non-AI features are usable. Superadmins have a **Re-run benchmark** button on the Admin page.
+
+**Threading rule (Streamlit):** background threads never call `st.*`. The worker only updates a shared `AIStatus` object (behind a `threading.Lock`, held by the `@st.cache_resource` services object). The sidebar re-reads it on every rerun and uses `@st.fragment(run_every=2)` to refresh while `state` is `checking` or `downloading`.
+
+**Download consent flow:** when `state == "needs_download_consent"`, the sidebar shows "AI features need a one-time download of <size>" with **Download** and **Not now** buttons. **Download** (a normal button click on the main thread) starts a worker thread that downloads with progress into `download_progress`, then resumes the ladder at step 3. **Not now** sets `state="disabled"` with the reason "Model not downloaded", and offers the button again on the Admin page.
+
+**Machine fingerprint:** SHA-256 of CPU model (`platform.processor()`, or `sysctl -n machdep.cpu.brand_string` on macOS), total RAM (`psutil`), OS name and version, Ollama version (`GET /api/version`) and the model's digest (`POST /api/show`). GPU name is not included: there's no reliable cross-platform way to read it without extra dependencies, and the model digest + Ollama version already change when the setup changes.
 
 **Feature gating by model** (config table, adjustable once §11.2 evals exist):
 
@@ -969,18 +1045,33 @@ def machine_fingerprint(client: OllamaClient, model: str) -> str: ...
 ```python
 @dataclass(frozen=True)
 class ModelArtifact:
-    name: str            # "coalescedb-sql:1.5b"
-    url: str             # Release download URL
-    sha256: str          # Pinned in code
+    name: str                    # "coalescedb-sql:1.5b"
+    gguf_filename: str           # "coalescedb-sql-1.5b-Q4_K_M.gguf"
+    url: str                     # Release download URL
+    sha256: str                  # Pinned in code
     size_bytes: int
-    modelfile: str       # Bundled Modelfile text
+    template: str                # Chat template text (copied from the stock model, §16.5)
+    parameters: dict[str, Any]   # {"temperature": 0, "num_ctx": 8192}
 
-def ensure_model(client: OllamaClient, artifact: ModelArtifact, progress: Callable[[int, int], None]) -> None: ...
-    # Download to data_dir/models/tmp, verify SHA-256 (delete and raise on mismatch),
-    # then register with Ollama using its blob-upload + create API (check the current Ollama API
-    # docs; this API has changed between versions). If the artifact is unavailable or fails
-    # verification, fall back to the stock qwen2.5-coder models via /api/pull.
+def ensure_model(client: OllamaClient, artifact: ModelArtifact,
+                 progress: Callable[[int, int], None]) -> None: ...
 ```
+
+`ensure_model` steps:
+1. Skip if `POST /api/show` already returns the model with a matching digest.
+2. Download to `data_dir/models/tmp/<gguf_filename>` with progress, verify SHA-256 (delete the file and raise on mismatch).
+3. Upload the file to Ollama's blob store: `HEAD /api/blobs/sha256:<digest>`, and if missing, `POST /api/blobs/sha256:<digest>` with the file as the body.
+4. Register it: `POST /api/create` with **structured fields**, not Modelfile text (current Ollama rejects a `modelfile` field with "neither 'from' or 'files' was specified"):
+   ```json
+   {"model": "coalescedb-sql:1.5b",
+    "files": {"coalescedb-sql-1.5b-Q4_K_M.gguf": "sha256:<digest>"},
+    "template": "<artifact.template>",
+    "parameters": {"temperature": 0, "num_ctx": 8192},
+    "stream": false}
+   ```
+5. Delete the temporary file. On any failure, fall back to the stock model of the same size via `/api/pull`.
+
+Check these request shapes against the installed Ollama's API docs during M15; `test_benchmark.py` uses a fake server that enforces this exact shape.
 
 ### 6.23 Data Frames & Charts — `analytics/frames.py`, `analytics/charts.py`
 
@@ -1145,7 +1236,7 @@ class ColumnMeta:
     unit: str | None      # "AED", "units", "days", "%"
     per: float = 1.0      # Express effects per this many units, e.g. 1000 → "per AED 1,000"
 ```
-Stored per database in an internal table `_app_column_meta` (written only through the app's internal connection; user SQL can't touch `_app_*` tables per §6.2). Editable on the Analyze page; if not set, Python picks a readable scale (e.g. "per 1,000" when the per-unit effect rounds to zero).
+Stored in `app.db` (not in the user database), in a table `column_meta(db_name, table_name, column_name, label, unit, per, PRIMARY KEY (db_name, table_name, column_name))`, read and written only through `AppStore`. Viewers can read labels; admins of that database can edit them. `DatabaseRegistry.rename/delete` update or remove the rows along with grants. Keeping it in `app.db` means user databases stay untouched and no extra write connection to them is needed. Editable on the Analyze page; if not set, Python picks a readable scale (e.g. "per 1,000" when the per-unit effect rounds to zero).
 
 **How Python phrases each result** (examples of `Fact.sentence`):
 - Linear coefficient: "Each additional AED 1,000 of marketing spend is associated with about 42 more units sold (likely between 30 and 54), when the other factors stay the same."
@@ -1269,7 +1360,7 @@ Columns (name: type): {columns_with_types}
 
 ## 8. User Interface — `app.py`, `ui/`
 
-### 8.1 Page Routing
+### 8.1 Page Routing — `ui/main.py`
 
 ```python
 def main() -> None:
@@ -1277,11 +1368,12 @@ def main() -> None:
     services = get_services(settings)          # @st.cache_resource: AppStore, AuthService, Registry, Executor, LLM
     if not services.auth.store.has_any_user(): ui.login.first_run_setup(services); return
     if (sess := ui.state.current_session()) is None: ui.login.login_page(services); return
-    page = ui.sidebar.render(services, sess)   # returns "query" | "ingest" | "admin"
-    {"query": ui.chat.render, "ingest": ui.ingest_page.render, "admin": ui.admin_page.render}[page](services, sess)
+    page = ui.sidebar.render(services, sess)   # returns "query" | "analyze" | "ingest" | "admin"
+    {"query": ui.chat.render, "analyze": ui.analyze_page.render,
+     "ingest": ui.ingest_page.render, "admin": ui.admin_page.render}[page](services, sess)
 ```
 
-`ui.state` stores only `user_id` and `db_name` in `st.session_state`; the `User` object and role are re-loaded from `AuthService` on every rerun, so a revoked grant takes effect immediately.
+`ui.sidebar.render` only returns pages the user may open (Import: admin of the current DB; Admin: superadmin), and each page re-checks on entry. `ui.state` stores only `user_id` and `db_name` in `st.session_state`; the `User` object and role are re-loaded from `AuthService` on every rerun, so a revoked grant takes effect immediately.
 
 ### 8.2 Sidebar
 
@@ -1353,21 +1445,45 @@ Every result tab has an **Explain** panel: the deterministic explanation is alwa
 
 ### 9.1 Launcher — `launcher.py`
 
+Streamlit installs signal handlers, which Python only allows on the **main thread**, and pywebview also needs the main thread (especially on macOS). So Streamlit can't run in a thread; it runs in a **child process**. The same executable plays both roles, chosen by a command-line flag:
+
 ```python
 def main() -> None:
-    multiprocessing.freeze_support()                     # Required for analytics workers in a PyInstaller build
-    settings = load_settings()
-    port = find_free_port()                              # 127.0.0.1 only
-    sidecar = OllamaSidecar(settings); sidecar.ensure_running()   # §9.2, non-fatal on failure
-    start_streamlit_in_thread(app_path=resource_path("app.py"), port=port)
-        # Uses streamlit.web.bootstrap.run(...) with flag_options:
-        # server.port, server.address=127.0.0.1, server.headless=True, global.developmentMode=False
-    wait_until_http_ok(f"http://127.0.0.1:{port}/_stcore/health", timeout_s=30)
-    open_window_or_browser(f"http://127.0.0.1:{port}")   # pywebview if importable, else webbrowser
-    # On window close / Ctrl+C: sidecar.stop(); exit.
+    multiprocessing.freeze_support()          # Required for analytics workers in a PyInstaller build
+    if "--serve" in sys.argv:                 # Child process: run the Streamlit server
+        serve(port=int(sys.argv[sys.argv.index("--serve") + 1]))
+        return
+    run_launcher()                            # Parent process: sidecar, child, window
 
-def resource_path(rel: str) -> Path: ...                 # Handles sys._MEIPASS when frozen
+def serve(port: int) -> None:
+    os.environ["MPLBACKEND"] = "Agg"
+    from streamlit.web import cli as stcli
+    sys.argv = ["streamlit", "run", str(resource_path("app.py")),
+                "--server.port", str(port), "--server.address", "127.0.0.1",
+                "--server.headless", "true", "--global.developmentMode", "false"]
+    sys.exit(stcli.main())                    # Runs on this process's main thread
+
+def run_launcher() -> None:
+    settings = load_settings()
+    port = find_free_port()                   # 127.0.0.1 only
+    sidecar = OllamaSidecar(settings); sidecar.ensure_running()   # §9.2, non-fatal on failure
+    child = subprocess.Popen(child_command(port))
+    try:
+        wait_until_http_ok(f"http://127.0.0.1:{port}/_stcore/health", timeout_s=30)
+        open_window_or_browser(f"http://127.0.0.1:{port}")   # pywebview on main thread; blocks until closed
+    finally:
+        child.terminate(); child.wait(timeout=10)
+        sidecar.stop()
+
+def child_command(port: int) -> list[str]: ...
+    # Frozen (PyInstaller): [sys.executable, "--serve", str(port)]  — sys.executable is the app itself
+    # Source:               [sys.executable, str(Path(__file__)), "--serve", str(port)]
+    # Note: "python -m streamlit" does NOT work in a frozen app, which is why the app re-launches itself.
+
+def resource_path(rel: str) -> Path: ...      # Handles sys._MEIPASS when frozen
 ```
+
+If pywebview isn't available, `open_window_or_browser` opens the default browser and the launcher waits until the child exits or the user quits from a small tray/console prompt.
 
 ### 9.2 Ollama Sidecar — `llm/sidecar.py`
 
@@ -1375,7 +1491,8 @@ def resource_path(rel: str) -> Path: ...                 # Handles sys._MEIPASS 
 class OllamaSidecar:
     def ensure_running(self) -> SidecarStatus: ...
         # 1. If settings.ollama_host answers GET /api/version → use it (user already has Ollama).
-        # 2. Else find binary: resources/bin/ollama[.exe] (bundled) → shutil.which("ollama").
+        # 2. Else find binary: the bundled Ollama folder (resources/ollama/, see below)
+        #    → shutil.which("ollama").
         # 3. Start `ollama serve` with env OLLAMA_HOST=127.0.0.1:<free port>,
         #    OLLAMA_MODELS=<data_dir>/models; update the effective host; wait for /api/version.
         # 4. Model installation is NOT done here. resolve_ai_status (§6.22) runs in a
@@ -1387,7 +1504,7 @@ class OllamaSidecar:
     def stop(self) -> None: ...     # Only stops a process this sidecar started
 ```
 
-`packaging/fetch_ollama.py` downloads the official Ollama release for the build OS into `packaging/resources/bin/` during CI builds. Bundling it makes the installer large (the Ollama runtime with GPU libraries is hundreds of MB); a "lite" build without it is also produced for users who already have Ollama. Include Ollama's MIT license text in the bundle.
+`packaging/fetch_ollama.py` downloads the official Ollama release archive for the build OS and **extracts the whole thing** into `packaging/resources/ollama/`, keeping its folder layout. Ollama ships as a binary plus a folder of libraries (CPU/GPU runners), not a single file, and it finds those libraries relative to its own location. The script records which file is the executable, verifies the download's checksum where Ollama publishes one, and fails the build if the layout isn't what it expects. Check the current release layout on Ollama's GitHub releases page when writing this script. Bundling it makes the installer large (the Ollama runtime with GPU libraries is hundreds of MB); a "lite" build without it is also produced for users who already have Ollama. Include Ollama's MIT license text in the bundle.
 
 ### 9.3 PyInstaller — `packaging/coalescedb.spec`
 
@@ -1395,7 +1512,12 @@ class OllamaSidecar:
 - `collect_all("streamlit")`, `copy_metadata("streamlit")`, `collect_data_files("sqlglot")`, `copy_metadata` for `pydantic`, `argon2-cffi`, `pypdf`, `openpyxl`.
 - Version 2: `collect_submodules("sklearn")`, `collect_submodules("statsmodels")`, `collect_submodules("scipy")`, `collect_data_files("plotly")`, `collect_data_files("matplotlib")`, `copy_metadata("xlsxwriter")`. Set `MPLBACKEND=Agg` in the launcher. Exclude `tkinter`, `IPython`, `torch` and anything from `training/` to keep size down.
 - Smoke test after every build: launch the built app, run one chart export (PNG and PDF), one regression and one forecast. Missing hidden imports in scientific libraries usually only show up when a feature is first used.
-- `datas`: `app.py`, `src/coalescedb/**`, `.streamlit/config.toml`, `resources/bin/*` (full build only).
+- **Making PyInstaller see all imports:** PyInstaller only bundles libraries it finds by following `import` statements from the entry script, and it doesn't look inside files listed as data. So:
+  - `pathex=["src"]`, and `launcher.py` does `import coalescedb.ui.main` (unused at runtime in the parent, but it makes PyInstaller follow every import in the app).
+  - `hiddenimports += collect_submodules("coalescedb")` as a second safety net.
+  - `app.py` is still shipped as a data file, because Streamlit runs it from disk, but it contains only `from coalescedb.ui.main import main; main()`.
+- `datas`: `app.py`, `.streamlit/config.toml`, `resources/ollama/**` (full build only). The `coalescedb` package itself is bundled as code, not data.
+- Build check: after building, run `dist/CoalesceDB/CoalesceDB --serve 8599` from a terminal and load every page once; an `ImportError` there means a missing hidden import.
 - Output: `dist/CoalesceDB/` → zipped for Windows; `.app` then `.dmg` on macOS.
 - Code signing is out of scope for v1; README explains the Windows SmartScreen / macOS Gatekeeper prompt.
 
@@ -1466,8 +1588,16 @@ Each item maps to a test in §11.1.
 | `VACUUM INTO '/tmp/x.db'` | reject | reject |
 | empty string / only comments | reject | reject |
 | 20 KB of SQL | reject | reject |
+| `CREATE TABLE t (a INTEGER)` | reject | allow |
+| `CREATE TEMP TABLE t (a)` | reject | reject |
+| `CREATE TEMPORARY TABLE t (a)` | reject | reject |
+| `CREATE VIRTUAL TABLE t USING fts5(a)` | reject | reject |
+| `CREATE TABLE t (a INTEGER) STRICT` | reject | reject |
+| `CREATE TABLE t (a INTEGER PRIMARY KEY) WITHOUT ROWID` | reject | reject |
+| `CREATE TABLE t (strict_mode INTEGER)` | reject | allow |
+| `SELECT * FROM "Order" WHERE "CustomerId" = 1` | allow | allow |
 
-`test_authorizer.py`: bypasses the guard entirely and executes forbidden statements directly on a viewer connection, asserting SQLite refuses them. This proves the layers are independent.
+`test_authorizer.py`: bypasses the guard entirely and executes forbidden statements directly on viewer and admin connections, asserting SQLite refuses them (viewer: any write; admin: ATTACH, PRAGMA, CREATE TRIGGER, CREATE TEMP TABLE, CREATE VIRTUAL TABLE, writes to `_app_*`). It also asserts that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... ADD COLUMN` and `DROP TABLE` **succeed** on an admin connection. This proves the layers are independent and that the authorizer doesn't block normal admin work.
 
 `test_auth.py`: usernames like `admin'--`, `x; DROP TABLE users`, `a b`, `ab` are rejected; lockout after 5 failures; timing path for unknown users calls verify; last superadmin cannot be deleted; revoked grant blocks the next execute.
 
@@ -1545,18 +1675,18 @@ In this order, so the first screen answers "what is it and does it work":
 
 | # | Milestone | Acceptance criteria |
 |---|---|---|
-| M1 | Project skeleton, `config.py`, `errors.py`, `models.py`, `identifiers.py` | `pytest tests/security/test_identifiers.py` passes |
-| M2 | `AppStore`, `passwords.py`, `AuthService` | `test_auth.py` passes |
-| M3 | `DatabaseRegistry`, `connection.py` (authorizer), `introspect.py` | `test_registry_paths.py`, `test_authorizer.py` pass |
-| M4 | `sql_guard.py`, `policy.py` | Every row of the §11.1 table passes |
-| M5 | `Executor`, `BackupService`, tracing | `test_executor.py` passes; destructive delete creates a backup |
-| M6 | Streamlit UI: login, first-run setup, sidebar, Write-SQL mode, admin page | Manual: two users, viewer blocked from writes in UI *and* by direct executor call |
-| M7 | `OllamaClient`, `text_to_sql.py`, Ask-in-English mode, behind-the-scenes panel | Works end-to-end with Ollama; `FakeLLMClient` tests pass |
-| M8 | Spreadsheet import (`readers.py` XLSX/CSV, `tabular.py`) | `test_ingest_tabular.py` passes; messy headers normalized |
-| M9 | PDF reading, chunking, `schema_design.py`, `extraction.py`, templates, Import page | `test_schema_design.py`, `test_extraction.py` pass incl. injection document |
-| M10 | Evals harness + first `results.md` | Numbers recorded for 1.5b (and 7b if hardware allows) |
-| M11 | `launcher.py`, `sidecar.py`, PyInstaller spec | Built app starts on a clean machine, pulls model on first run, works offline after |
-| M12 | CI workflows, README, demo GIF, Docker compose | CI green; README meets §14 |
+| M1 | Project skeleton (§1, §2), `config.py` (§3), `errors.py` (§4), `models.py` (§5), `identifiers.py` (§6.8) | `pytest tests/security/test_identifiers.py` passes, incl. both quoting functions |
+| M2 | `AppStore`, `passwords.py`, `AuthService` (§6.1) | `test_auth.py` passes |
+| M3 | `DatabaseRegistry` (§6.3), `connection.py` + authorizer (§6.4), `introspect.py` (§6.5) | `test_registry_paths.py`, `test_authorizer.py` pass, incl. admin DDL succeeding |
+| M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes |
+| M5 | `Executor` (§6.6), `BackupService` (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many` and `apply_schema`; destructive delete creates a backup |
+| M6 | Streamlit UI (§8.1–8.3, §8.5, §8.6): login, first-run setup, sidebar, Write-SQL mode, admin page | Manual: two users, viewer blocked from writes in UI *and* by direct executor call |
+| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Ask-in-English mode, behind-the-scenes panel | Works end-to-end with Ollama; `FakeLLMClient` tests pass, incl. `EXPLAIN`-based self-correction |
+| M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized |
+| M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document |
+| M10 | Evals harness + first `results.md` (§11.2) | Numbers recorded for 1.5b (and 7b if hardware allows) |
+| M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3) | Built app starts on a clean machine, downloads the model on first run after consent, works offline after |
+| M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 |
 | M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel |
 | M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact |
 | M15 | Benchmark & model ladder (§6.22), AI status in sidebar, feature gating | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking |
@@ -1607,6 +1737,7 @@ Rules:
 4. Re-run the full §11.2 evals **on the quantized GGUF through Ollama**, not on the training-time model; that is what users get.
 
 ### 16.5 Modelfile & distribution
+The Modelfile below is for testing the model by hand (`ollama create coalescedb-sql:1.5b -f training/Modelfile.1_5b`). The app itself registers the model through the API with the same template and parameters (§6.22 `ensure_model`), so copy the template text into `ModelArtifact.template` too.
 ```
 FROM ./coalescedb-sql-1.5b-Q4_K_M.gguf
 TEMPLATE """<copy the TEMPLATE from `ollama show qwen2.5-coder:1.5b --modelfile`>"""
