@@ -229,6 +229,15 @@ class AppStore:
                 "DELETE FROM grants WHERE user_id = ? AND db_name = ?", (user_id, db_name)
             )
 
+    def delete_grants_for_db(self, db_name: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM grants WHERE db_name = ?", (db_name,))
+
+    def rename_grants(self, old: str, new: str) -> None:
+        # One UPDATE, so either every grant moves or none does.
+        with self._connect() as conn:
+            conn.execute("UPDATE grants SET db_name = ? WHERE db_name = ?", (new, old))
+
     def get_grant(self, user_id: int, db_name: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -21,6 +21,14 @@ IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}\Z")  # \Z, not $: "abc\n" must no
 # Always used with .fullmatch().
 DB_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")
 
+# Windows treats these names as devices, so "con.db" can't be created safely there. They
+# are refused on every OS so a database made on a Mac still works on Windows.
+WINDOWS_RESERVED_NAMES: frozenset[str] = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{n}" for n in range(1, 10)}
+    | {f"lpt{n}" for n in range(1, 10)}
+)
+
 # Full keyword list from https://www.sqlite.org/lang_keywords.html, stored lowercase.
 SQLITE_KEYWORDS: frozenset[str] = frozenset(
     """
@@ -43,6 +51,17 @@ SQLITE_KEYWORDS: frozenset[str] = frozenset(
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _KEYWORD_SUFFIX = "_col"
 _DIGIT_PREFIX = "c_"
+
+
+def validate_db_name(name: str) -> str:
+    """Return `name` unchanged if it is a valid database name, else raise InvalidIdentifier."""
+    if (
+        not isinstance(name, str)
+        or DB_NAME_RE.fullmatch(name) is None
+        or name.lower() in WINDOWS_RESERVED_NAMES
+    ):
+        raise InvalidIdentifier("That database name isn't allowed.")
+    return name
 
 
 def to_snake_identifier(raw: str) -> str:

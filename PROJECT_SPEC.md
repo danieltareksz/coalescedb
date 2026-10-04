@@ -607,6 +607,9 @@ class DatabaseRegistry:
         # backups_dir/_deleted/<name>_<UTC timestamp>/, and revoke_all(db_name) clears stray
         # grants. Then creates an empty SQLite file and grants actor ADMIN. Audited
         # 'db_create'. The new database starts with no backups and no other users' grants.
+        # If creating the file, the grant or the audit entry fails, the .db file and any
+        # -wal/-shm are removed and the error is re-raised, so the name stays free and
+        # create() can be retried.
     def delete(self, actor: User, db_name: str, confirm_text: str) -> None: ...
         # Order: superadmin check → confirm_text == db_name (else PermissionDenied, as in
         # §6.6) → backups.snapshot(path, reason="db_delete") → revoke_all(db_name) → remove
@@ -616,9 +619,17 @@ class DatabaseRegistry:
     def rename(self, actor: User, old: str, new: str) -> None: ...   # updates grants atomically
         # superadmin only. Checked before anything moves: both names valid; old exists
         # (DatabaseNotFound); new file does not exist and backups_dir/<new>/ does not exist
-        # (DatabaseExists). Then: rename the file → revoke_all(new) to clear stray grants →
-        # rename_grants(old, new) → move backups_dir/<old>/ to backups_dir/<new>/.
-        # If the grants update fails, the file is renamed back. Audited 'db_rename'.
+        # (DatabaseExists). Then:
+        #   1. Checkpoint the write-ahead log (PRAGMA wal_checkpoint(TRUNCATE)) on a
+        #      connection opened only for this, never a user connection, so the -wal/-shm
+        #      files are normally gone before anything moves.
+        #   2. Inside one recovery block, recording each completed move: the .db file, any
+        #      -wal and -shm that still exist, then backups_dir/<old>/ to backups_dir/<new>/.
+        #   3. Still inside it, grants last: revoke_all(new) to clear stray grants, then
+        #      rename_grants(old, new).
+        # If any step in 2 or 3 fails, every completed move is undone in reverse order and
+        # the error is re-raised: the database is fully back under its old name.
+        # Audited 'db_rename'.
     def import_file(self, actor: User, src: Path, db_name: str) -> Path: ...
         # superadmin only; DatabaseExists if db_name is taken.
         # Accepts an existing .sqlite/.db; verifies header "SQLite format 3\0"; runs
@@ -626,6 +637,11 @@ class DatabaseRegistry:
         # kept as they are (e.g. "Order", "CustomerId", "First Name"); the app reads them with
         # quote_existing_identifier (§6.8). The file is rejected if it contains triggers or
         # virtual tables (listed by name in the error), since the authorizer blocks creating them.
+        # A virtual table is detected by sqlite_master.rootpage = 0 on a type='table' row
+        # (it has no storage of its own), which does not depend on the stored SQL text; a
+        # crafted file can disguise that text with odd whitespace, letter case or comments.
+        # A case-insensitive, whitespace-tolerant match of "CREATE VIRTUAL TABLE" on the
+        # text is kept as a second signal.
         # Steps: copy src to a temp file inside databases_dir (a name list_databases ignores)
         # → header check → integrity check → trigger / virtual-table check → move a leftover
         # backups_dir/<name>/ to backups_dir/_deleted/<name>_<UTC timestamp>/ (as in create)
@@ -633,6 +649,8 @@ class DatabaseRegistry:
         # that fails a check removes the temp file and raises IngestError, before anything
         # else is touched; src is never modified. Audited 'db_import'.
 ```
+
+**Known limitation:** `delete` and `rename` are not atomic. They change files on disk and rows in `app.db` one after the other, and there is no single transaction that covers both, so a crash or power loss midway can leave the two out of step (for example a database file whose grants are already revoked). The step order above is chosen so the worst case is recoverable: `delete` always takes the backup first, and `rename` undoes every move it has made if a later move or the grants update fails. What `rename` cannot undo is a crash of the app itself partway through, and the clearing of stray grants for the new name.
 
 ### 6.4 Role-Scoped Connections — `db/connection.py`
 
@@ -647,6 +665,8 @@ Requirements:
 
 - **Viewer:** open with URI `path.resolve().as_uri() + "?mode=ro"` and `uri=True`, then `PRAGMA query_only = ON`. The file handle itself is read-only. (`as_uri()` percent-encodes the path, so a data folder containing a space, `#`, `?` or `%`, or a Windows drive letter, still opens.)
 - **All connections to user databases:** `PRAGMA trusted_schema = OFF`, run with the other PRAGMAs before the authorizer is installed. This is SQLite's own advice for database files the app didn't create (imports, §6.3).
+- **Leftover WAL files:** when a viewer reads a database that an admin connection left in WAL mode, SQLite may create `<name>.db-wal` and `<name>.db-shm` beside it, and a read-only connection cannot remove them when it closes. They are harmless: `list_databases` ignores them, and `delete` and `rename` remove or move them with the database (§6.3).
+- **Missing files:** opening a path that is not an existing file raises `DatabaseNotFound`, for both roles and for the internal connection. Admin connections are opened with `mode=rw` (not `rwc`), so they never create a missing file.
 - **Admin:** normal read-write connection, `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`. These PRAGMAs are run **before** the authorizer is installed, because the authorizer then denies all PRAGMAs.
 - **Both:** `conn.enable_load_extension(False)` where available.
 - **Autocommit:** connections are opened in autocommit mode (`isolation_level=None`); callers that need a transaction issue `BEGIN`/`COMMIT` themselves, which the Executor (M5) relies on.
@@ -654,11 +674,13 @@ Requirements:
   - Viewer allowlist: `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION` (only if function name not in `FORBIDDEN_FUNCTIONS`), `SQLITE_RECURSIVE`. Everything else → `SQLITE_DENY`.
   - Admin: deny `SQLITE_ATTACH`, `SQLITE_DETACH`, `SQLITE_PRAGMA`, `SQLITE_CREATE_TRIGGER`, all `SQLITE_CREATE_TEMP_*` codes, `SQLITE_CREATE_VTABLE`, `SQLITE_DROP_VTABLE`, forbidden functions, and any write to `_app_*` tables. Allow the rest.
   - **Forbidden functions, both roles:** `FORBIDDEN_FUNCTIONS` is imported from `security/policy.py` (§6.2). The name SQLite reports is compared case-insensitively (`name.lower() in FORBIDDEN_FUNCTIONS`), and both the viewer and the admin authorizer deny every function in it.
-  - **`_app_*` tables:** the prefix is matched case-insensitively (`_APP_meta` is the same table to SQLite). "Any write" means `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`/`DROP INDEX` on such a table, and `ALTER TABLE` on one (adding a column, or renaming it away).
+  - **`_app_*` tables:** the prefix is matched case-insensitively (`_APP_meta` is the same table to SQLite). "Any write" means `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`/`DROP INDEX` on such a table, `ALTER TABLE` on one (adding a column, or renaming it away), and `CREATE VIEW`/`DROP VIEW` of a view with such a name: nothing named `_app_*` can be created or dropped by an admin at all.
+  - **The `temp` schema:** `CREATE TABLE temp.x (...)` reaches SQLite's temporary schema without the `TEMP` keyword, and SQLite reports it as a plain `SQLITE_CREATE_TABLE` whose database-name argument is `temp`. The admin authorizer therefore also denies any create, drop or alter action whose database-name argument is `temp` (compared case-insensitively): creating or dropping a table, index, view or trigger there, and `ALTER TABLE` on a temp table (for `SQLITE_ALTER_TABLE` the database name is the first argument, not the fourth). Reads and SQLite's own bookkeeping updates of `sqlite_temp_master` during an ordinary `ALTER TABLE` stay allowed.
+  - **Forbidden functions inside views:** a view in an imported file whose body calls a forbidden function (e.g. `CREATE VIEW v AS SELECT load_extension('x')`) cannot be used to run it. Selecting from it is refused on viewer and admin connections, and the function never runs: with `trusted_schema = OFF` SQLite itself rejects it ("unsafe use of ...") before the authorizer is even asked. `test_authorizer.py` covers this.
   - **Known limit — rename targets:** for `ALTER TABLE t RENAME TO _app_x`, SQLite only ever tells the authorizer the *old* name (`t`); the new name is never passed to it (checked on SQLite 3.53.1). The authorizer therefore cannot refuse a rename by its target. That statement is covered by the guard instead: step 7 of §6.2 (built in M4) rejects any reference to an `_app_` name, and `test_sql_guard.py` has a row for `ALTER TABLE t RENAME TO _app_x` (§11.1). The case is not part of `test_authorizer.py` (M3).
   - A statement the authorizer denies raises `sqlite3.DatabaseError` ("not authorized") from the connection. Turning that into the app's `ExecutionError` is the Executor's job (§6.6).
   - **Do not deny writes to `sqlite_*` tables for admins.** SQLite reports every `CREATE`, `DROP` and `ALTER` as a write to `sqlite_master`, so that rule blocks all schema changes. Direct tampering (`UPDATE sqlite_master`, `PRAGMA writable_schema`) is already stopped by guard step 7 and the PRAGMA deny. `test_authorizer.py` must confirm that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` succeed for admins.
-  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
+  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. The internal connection has a fixed timeout of 30 s (it has no `timeout_s` argument); this mainly bounds `integrity_check` on a large import. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
 - **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`.
 
 ### 6.5 Introspection — `db/introspect.py`
@@ -743,7 +765,8 @@ class BackupService:
     def snapshot(self, db_path: Path, reason: str) -> Path: ...
         # Uses sqlite3 Connection.backup() into backups_dir/<db>/<ts>_<reason>.db
         # <db> is db_path's file name without ".db", validated with validate_db_name (§6.8)
-        # before the folder path is built. A missing db_path raises DatabaseNotFound.
+        # before the folder path is built. db_path's file name must end in ".db"
+        # (InvalidIdentifier otherwise). A missing db_path raises DatabaseNotFound.
         # <ts> is UTC as <YYYYMMDD>T<HHMMSS>_<microseconds>Z (no colons: Windows forbids
         # them in file names). reason must match ^[a-z_]{1,32}\Z.
         # Prunes to settings.backups_to_keep per database, oldest first. Pruning only ever

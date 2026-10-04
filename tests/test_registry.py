@@ -4,6 +4,7 @@ Path safety is covered in tests/security/test_registry_paths.py.
 """
 
 import hashlib
+import os
 import re
 import sqlite3
 import sys
@@ -541,3 +542,140 @@ def test_non_superadmins_are_refused(
     assert read_items(path) == [0, 1, 2]
     assert grants(settings) == before
     assert not (settings.backups_dir / "sales").exists()
+
+
+# --- rename: a failing grants update puts the file back ---------------------------------
+
+
+def test_rename_puts_the_file_back_when_the_grants_update_fails(
+    registry, auth, backups, settings, superadmin, alice, monkeypatch
+):
+    path = registry.create(superadmin, "sales")
+    fill(path)
+    auth.grant(superadmin, alice.id, "sales", Role.VIEWER)
+    snapshot = backups.snapshot(path, "manual")
+    before = grants(settings)
+
+    def failing_rename_grants(actor, old, new):
+        raise RuntimeError("app.db is locked")
+
+    monkeypatch.setattr(auth, "rename_grants", failing_rename_grants)
+
+    with pytest.raises(RuntimeError, match="app.db is locked"):
+        registry.rename(superadmin, "sales", "crm")
+
+    # The file is back under the old name, with its rows; nothing is left under the new one.
+    assert path.exists()
+    assert not [name for name in database_files(settings) if name.startswith("crm")]
+    assert read_items(path) == [0, 1, 2]
+    assert registry.list_databases() == ["sales"]
+    # Every grant is unchanged.
+    assert grants(settings) == before
+    assert auth.role_for(alice, "sales") is Role.VIEWER
+    assert auth.role_for(alice, "crm") is None
+    # The backup folder was not moved.
+    assert (settings.backups_dir / "sales" / snapshot.name).exists()
+    assert not (settings.backups_dir / "crm").exists()
+    assert audit_entries(auth, superadmin, "db_rename") == []
+
+
+# --- rename: a failing file move undoes the moves already made --------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="open files can't be moved on Windows")
+def test_rename_undoes_completed_moves_when_a_later_move_fails(
+    registry, auth, settings, superadmin, alice, monkeypatch
+):
+    path = registry.create(superadmin, "sales")
+    fill(path)
+    auth.grant(superadmin, alice.id, "sales", Role.VIEWER)
+    before = grants(settings)
+    real_rename = os.rename
+
+    def rename_that_fails_on_the_wal(source, target, *args, **kwargs):
+        if str(source).endswith("sales.db-wal"):
+            raise OSError("disk error")
+        return real_rename(source, target, *args, **kwargs)
+
+    conn = sqlite3.connect(path)
+    try:
+        # An open connection in WAL mode keeps sales.db-wal and sales.db-shm on disk.
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("INSERT INTO items (n) VALUES (99)")
+        conn.commit()
+        assert path.with_name("sales.db-wal").exists()
+        monkeypatch.setattr(os, "rename", rename_that_fails_on_the_wal)
+
+        with pytest.raises(OSError, match="disk error"):
+            registry.rename(superadmin, "sales", "crm")
+
+        monkeypatch.undo()
+        # The database is fully back under the old name; nothing is left under the new one.
+        assert path.exists()
+        assert not [name for name in database_files(settings) if name.startswith("crm")]
+        assert registry.list_databases() == ["sales"]
+    finally:
+        conn.close()
+    assert read_items(path) == [0, 1, 2, 99]
+    assert grants(settings) == before
+    assert auth.role_for(alice, "sales") is Role.VIEWER
+    assert audit_entries(auth, superadmin, "db_rename") == []
+
+
+# --- import_file: virtual tables are detected whatever their stored SQL looks like ------
+
+
+@pytest.mark.parametrize(
+    "stored_sql",
+    [
+        "CREATE VIRTUAL  TABLE vt_search USING fts5(a)",  # two spaces
+        "CREATE\tVIRTUAL TABLE vt_search USING fts5(a)",  # a tab
+        "create  virtual\ttable vt_search using fts5(a)",  # lowercase and odd whitespace
+        "CREATE/**/VIRTUAL/**/TABLE vt_search USING fts5(a)",  # comments instead of spaces
+    ],
+)
+def test_import_refuses_a_virtual_table_whose_stored_sql_is_disguised(
+    registry, auth, settings, superadmin, tmp_path, stored_sql
+):
+    source = make_source(
+        tmp_path / "crafted.db", "CREATE TABLE t (a); CREATE VIRTUAL TABLE vt_search USING fts5(a);"
+    )
+    conn = sqlite3.connect(source)
+    conn.execute("PRAGMA writable_schema = ON")
+    conn.execute("UPDATE sqlite_master SET sql = ? WHERE name = 'vt_search'", (stored_sql,))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(IngestError) as excinfo:
+        registry.import_file(superadmin, source, "sales")
+
+    assert "vt_search" in excinfo.value.user_message
+    assert database_files(settings) == []
+    assert registry.list_databases() == []
+    assert grants(settings) == []
+    assert audit_entries(auth, superadmin, "db_import") == []
+
+
+# --- create: a failure part-way leaves nothing behind -----------------------------------
+
+
+def test_create_leaves_no_file_when_the_grant_fails_and_can_be_retried(
+    registry, auth, settings, superadmin, monkeypatch
+):
+    def failing_grant(actor, user_id, db_name, role):
+        raise RuntimeError("app.db is locked")
+
+    monkeypatch.setattr(auth, "grant", failing_grant)
+    with pytest.raises(RuntimeError, match="app.db is locked"):
+        registry.create(superadmin, "sales")
+
+    assert database_files(settings) == []  # no .db, no -wal, no -shm
+    assert registry.list_databases() == []
+    assert grants(settings) == []
+    assert audit_entries(auth, superadmin, "db_create") == []
+
+    monkeypatch.undo()
+    path = registry.create(superadmin, "sales")  # the name is free, so a retry works
+    assert registry.list_databases() == ["sales"]
+    assert list_tables(path) == []
+    assert grants(settings) == [(superadmin.id, "sales", "admin")]

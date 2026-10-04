@@ -15,7 +15,7 @@ from collections.abc import Collection
 from coalescedb.auth.passwords import hash_password, needs_rehash, verify_password
 from coalescedb.auth.store import AppStore, UserRow
 from coalescedb.config import Settings
-from coalescedb.db.identifiers import DB_NAME_RE
+from coalescedb.db.identifiers import validate_db_name
 from coalescedb.errors import (
     AccountLockedError,
     AuthError,
@@ -68,9 +68,7 @@ class AuthService:
 
     @staticmethod
     def _validate_db_name(db_name: str) -> str:
-        if not isinstance(db_name, str) or DB_NAME_RE.fullmatch(db_name) is None:
-            raise InvalidIdentifier("That database name isn't allowed.")
-        return db_name
+        return validate_db_name(db_name)
 
     def _load(self, user: User) -> UserRow | None:
         """The user's current row in app.db, or None if they no longer exist."""
@@ -233,6 +231,25 @@ class AuthService:
         self._require_target(user_id)
         self._store.delete_grant(user_id, db_name)
         self.audit(actor, "revoke", db_name, {"user_id": user_id}, "system")
+
+    def require_superadmin(self, actor: User) -> None:
+        """Raise PermissionDenied unless the actor, re-loaded from app.db, is a superadmin."""
+        self._require_superadmin(actor)
+
+    def revoke_all(self, actor: User, db_name: str) -> None:
+        """Remove every user's grant on one database, in one statement."""
+        self._require_superadmin(actor)
+        self._validate_db_name(db_name)
+        self._store.delete_grants_for_db(db_name)
+        self.audit(actor, "revoke_all", db_name, {}, "system")
+
+    def rename_grants(self, actor: User, old: str, new: str) -> None:
+        """Move every user's grant from one database name to another, in one statement."""
+        self._require_superadmin(actor)
+        self._validate_db_name(old)
+        self._validate_db_name(new)
+        self._store.rename_grants(old, new)
+        self.audit(actor, "rename_grants", new, {"old": old, "new": new}, "system")
 
     def role_for(self, user: User, db_name: str) -> Role | None:
         """The user's role on a database right now. None means no access."""

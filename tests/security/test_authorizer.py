@@ -410,3 +410,133 @@ def test_internal_connection_to_a_missing_file_raises(tmp_path):
         with open_internal_connection(missing):
             pass
     assert not missing.exists()
+
+
+# --- Views named like _app_ tables -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE VIEW _app_v AS SELECT 1",
+        "CREATE VIEW _APP_v AS SELECT 1",
+        'CREATE VIEW "_App_V" AS SELECT name FROM t',
+    ],
+)
+def test_admin_cannot_create_a_view_with_an_app_name(db_path, sql):
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        conn.execute("SELECT 1").fetchall()
+    before = state(db_path)
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(sql)
+    assert state(db_path) == before
+
+
+@pytest.mark.parametrize("sql", ["DROP VIEW _app_existing", "DROP VIEW _APP_EXISTING"])
+def test_admin_cannot_drop_a_view_with_an_app_name(db_path, sql):
+    plain = sqlite3.connect(db_path)
+    plain.execute("CREATE VIEW _app_existing AS SELECT name FROM t")
+    plain.commit()
+    plain.close()
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        conn.execute("SELECT 1").fetchall()
+    before = state(db_path)
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(sql)
+    assert state(db_path) == before
+
+
+# --- The temp schema, reached with the "temp." prefix instead of the TEMP keyword -------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE temp.tt (a)",
+        "CREATE TABLE TEMP.tt (a)",
+        "CREATE TABLE Temp.tt AS SELECT * FROM t",
+        "CREATE VIEW temp.v AS SELECT 1",
+        "CREATE VIEW TEMP.v AS SELECT name FROM t",
+    ],
+)
+def test_admin_cannot_create_objects_in_the_temp_schema(db_path, sql):
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(sql)
+        leftovers = conn.execute("SELECT name FROM sqlite_temp_master").fetchall()
+        assert leftovers == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE INDEX temp.ti ON tt (a)",
+        "CREATE INDEX ti ON tt (a)",  # an index on a temp table lives in temp too
+        "ALTER TABLE temp.tt ADD COLUMN b",
+        "ALTER TABLE temp.tt RENAME TO tt2",
+        "DROP TABLE temp.tt",
+        "DROP TABLE TEMP.tt",
+    ],
+)
+def test_admin_cannot_change_an_existing_temp_table(db_path, sql):
+    from coalescedb.db.connection import _admin_authorizer
+
+    with open_connection(db_path, Role.ADMIN, 5.0) as conn:
+        # Put a temp table there with the authorizer switched off, then switch it back on:
+        # the only way to have one to test against, since creating it is refused.
+        conn.set_authorizer(None)
+        conn.execute("CREATE TEMP TABLE tt (a)")
+        conn.set_authorizer(_admin_authorizer)
+        before = conn.execute("SELECT type, name, sql FROM sqlite_temp_master").fetchall()
+
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(sql)
+        assert conn.execute("SELECT type, name, sql FROM sqlite_temp_master").fetchall() == before
+
+
+# --- Views that call a forbidden function ----------------------------------------------
+
+VIEW_FUNCTIONS = {"v_load": "load_extension", "v_read": "readfile"}
+
+
+@pytest.fixture
+def db_with_bad_views(db_path):
+    """As an imported file might be: views whose bodies call forbidden functions."""
+    plain = sqlite3.connect(db_path)
+    plain.execute("CREATE VIEW v_load AS SELECT load_extension('x') AS result")
+    plain.execute("CREATE VIEW v_read AS SELECT readfile('x') AS result")
+    plain.commit()
+    plain.close()
+    return db_path
+
+
+@pytest.mark.parametrize("role", BOTH_ROLES)
+@pytest.mark.parametrize("view", sorted(VIEW_FUNCTIONS))
+def test_selecting_from_a_view_that_calls_a_forbidden_function_is_refused(
+    db_with_bad_views, role, view
+):
+    with open_connection(db_with_bad_views, role, 5.0) as conn:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT * FROM " + view).fetchall()
+
+
+@pytest.mark.parametrize("role", BOTH_ROLES)
+@pytest.mark.parametrize("view", sorted(VIEW_FUNCTIONS))
+def test_a_forbidden_function_inside_a_view_never_runs(db_with_bad_views, role, view):
+    calls = []
+
+    def record(*args):
+        calls.append(args)
+        return "ran"
+
+    with open_connection(db_with_bad_views, role, 5.0) as conn:
+        # Make sure the function exists on this connection, so "no such function" can't be
+        # the reason the query fails.
+        conn.create_function(VIEW_FUNCTIONS[view], -1, record)
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT * FROM " + view).fetchall()
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT count(*) FROM t, " + view).fetchall()
+    assert calls == []
