@@ -4,6 +4,8 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 
 **Version 2 additions:** import from other SQL databases (dump files and, optionally, live connections) translated to SQLite; export results to CSV/XLSX; Excel-style charts saved as PNG/SVG/PDF; one-click analytics (summaries, correlation, regression, clustering, forecasting) built on pandas, NumPy, scikit-learn and statsmodels; plain-English business explanations of the results; a startup speed benchmark that picks the model size the machine can handle; and an optional fine-tuned, quantized model (§16).
 
+**Visual builder:** a non-technical user, with AI off, can query, edit and design tables by clicking (§6.27–§6.29). Typed SQL stays available as an advanced option. The UI is built with NiceGUI and follows `DESIGN.md` for look, layout and wording.
+
 > **How to use this spec with a coding agent:** Build in the milestone order in §15. Give the agent one milestone at a time and require the acceptance tests for that milestone to pass before moving on. Section numbers are stable; refer to them in prompts ("implement §6.2 exactly").
 
 ---
@@ -15,10 +17,11 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 3. **Allowlist, not denylist.** Queries are accepted only if every statement and node type is explicitly permitted. Unknown = rejected.
 4. **Humans confirm writes.** Any LLM-generated write (DDL or DML) is shown for review and needs an explicit click. Destructive writes also need a typed confirmation and trigger an automatic backup.
 5. **Deterministic where possible.** Type inference, identifier normalization, DDL compilation and inserts are plain Python. The model is used only where language understanding is actually required.
-6. **Local only.** No data leaves the machine. The web server binds to `127.0.0.1` only. The single exception is the optional live-database import (§6.20), which connects only to a host the admin types in, only while the import runs, and never sends data out — it only reads in.
+6. **Local only.** No data leaves the machine. The web server binds to `127.0.0.1` only; the host is always passed explicitly to `ui.run` (§8.6), because NiceGUI's own default outside native mode is `0.0.0.0`. Auto-reload and NiceGUI's remote-access ("On Air") feature are never enabled. The single exception is the optional live-database import (§6.20), which connects only to a host the admin types in, only while the import runs, and never sends data out — it only reads in.
 7. **The model never writes code that runs.** It may propose SQL (which passes every layer in principle 2). It never produces Python, chart code or model code. Charts and analytics are built from fixed, typed specifications filled in by the GUI; there is no `exec`/`eval` anywhere in the codebase.
 8. **Numbers come from code; words come from the model.** Every statistic, prediction and figure is computed by pandas/NumPy/scikit-learn/statsmodels. The model only rephrases already-computed facts, and any number it outputs that isn't in those facts causes its text to be discarded (§6.26).
-9. **AI is optional.** Every feature except "Ask in English", PDF import and plain-English explanations works with AI disabled (§6.22).
+9. **AI is optional.** Every feature except "Generate SQL", PDF import and plain-English explanations works with AI disabled (§6.22).
+10. **The UI never assembles SQL text.** Forms produce a typed spec (a pydantic model, like `ChartSpec`). Python compiles it (§6.27–§6.29): table and column names come only from introspection (§6.5) and are quoted with `quote_existing_identifier` (new names: `quote_identifier`); every value is a `?` parameter. The result goes through the Executor (§6.6), so role checks, guard, authorizer, confirmations, backups and audit apply exactly as for typed SQL. What reaches the Executor is only: builder output, SQL the user typed in Write SQL mode, or SQL the model proposed in Generate SQL mode. Model-proposed SQL is shown to the user, SELECTs run as described in §8.3, and writes always go through the review dialog, exactly like typed SQL.
 
 ---
 
@@ -27,7 +30,10 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 | Concern | Choice | Notes |
 |---|---|---|
 | Language | Python 3.11 or 3.12 | |
-| GUI | Streamlit ≥ 1.38 | Bound to 127.0.0.1 |
+| GUI | NiceGUI (MIT) | Spec checked against NiceGUI 3.17.1 (PyPI and nicegui.io, 2026-10-04). The exact pin is added to `requirements.txt` when M6 starts, with approval. Bound to 127.0.0.1 (§8.6). Runs on FastAPI/Starlette/uvicorn, which come with it |
+| Data grid | `ui.aggrid` (AG Grid Community, MIT; NiceGUI 3.17.1 bundles 34.2.0) | Community edition only. The Enterprise edition is never loaded (NiceGUI would fetch it from a URL) |
+| UI fonts | Geist (UI text), JetBrains Mono (data and SQL) | Both SIL Open Font License 1.1, which allows bundling with distributed software when the copyright notice and licence text are included. woff2 files served locally (§8.6); never fetched at runtime. **Assets to be added at M6 with approval; not in the repo yet** |
+| Icons | Material Symbols Outlined | Already shipped inside NiceGUI as a local file; no new asset |
 | Databases | SQLite via stdlib `sqlite3` | One `.db` file per database |
 | SQL parsing | `sqlglot` (dialect `sqlite`) | Allowlist validator |
 | LLM runtime | Ollama, model `qwen2.5-coder:1.5b` | Via HTTP; managed sidecar in packaged builds (§9) |
@@ -38,8 +44,8 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 | XLSX / CSV | `pandas` + `openpyxl` | `read_only=True`, `data_only=True` |
 | App paths | `platformdirs` | User-writable data dir in packaged mode |
 | System info | `psutil` (BSD) | Free/total RAM and CPU details for the benchmark (§6.22) |
-| Desktop window | `pywebview` (optional) | Falls back to opening the default browser |
-| Packaging | PyInstaller (`--onedir`) | `--onefile` is slow to start with Streamlit |
+| Desktop window | `pywebview` (optional) | Used through NiceGUI's native mode (`ui.run(native=True)`; NiceGUI 3.17.1 accepts pywebview ≥ 5.0.1, < 7). Falls back to opening the default browser (§9.1) |
+| Packaging | PyInstaller (`--onedir`) | `--onefile` unpacks to a temp folder on every start, so it starts slowly; NiceGUI's docs say the same |
 | Tests | `pytest`, `pytest-cov` | |
 | SQL dialect translation | `sqlglot` (already present) | `transpile(read=<dialect>, write="sqlite")` |
 | Live DB reflection (optional) | `sqlalchemy` 2.x + `psycopg[binary]` (PostgreSQL) + `PyMySQL` (MySQL) | Only installed with the `live-import` extra; SQL Server/Oracle use dump files instead |
@@ -63,13 +69,11 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 
 ```
 coalescedb/
-├── app.py                        # Two lines: `from coalescedb.ui.main import main; main()` (§9.3)
-├── launcher.py                   # Executable entry point: sidecar, server, window (§9)
+├── launcher.py                   # Entry point, packaged and from source: sidecar, server, window (§9)
+├── DESIGN.md                     # Look, layout and wording of the UI (§8)
 ├── pyproject.toml
 ├── requirements.txt
 ├── requirements-dev.txt
-├── .streamlit/
-│   └── config.toml               # Security-relevant server settings (§8.6)
 ├── src/
 │   └── coalescedb/
 │       ├── __init__.py
@@ -123,20 +127,28 @@ coalescedb/
 │       │   ├── modeling.py       # Regression, logistic, k-means (§6.24)
 │       │   ├── forecasting.py    # Trend + Holt-Winters with backtest (§6.25)
 │       │   └── explain.py        # Facts → plain-English text, number check (§6.26)
+│       ├── builder/              # Typed specs → SQL. No UI code, no NiceGUI imports
+│       │   ├── __init__.py
+│       │   ├── query.py          # QuerySpec → SELECT + params (§6.27)
+│       │   ├── edits.py          # RowChange list → INSERT/UPDATE/DELETE + params (§6.28)
+│       │   └── designer.py       # Table-designer operations → DDL (§6.29)
 │       ├── observability/
 │       │   ├── __init__.py
 │       │   └── tracing.py        # Local JSONL traces: latency, tokens (§6.17)
 │       └── ui/
 │           ├── __init__.py
-│           ├── main.py           # Page routing (§8.1); imported by app.py
-│           ├── state.py          # Typed wrapper around st.session_state
+│           ├── main.py           # run(): services, page registration, ui.run (§8.1, §8.6)
+│           ├── server.py         # Local-server controls: host/origin checks, upload cap, UI secret (§8.6)
+│           ├── theme.py          # The ONE place for style constants, colours and fonts (DESIGN.md §6)
+│           ├── session.py        # Typed wrapper around app.storage.user; re-loads User and role (§8.1)
+│           ├── shell.py          # Sidebar, toolbar, status bar, inspector frame (§8.2)
 │           ├── login.py          # Login + first-run admin setup page
-│           ├── sidebar.py        # DB picker, schema browser, user badge
-│           ├── chat.py           # NL/SQL input, results, review drawer
+│           ├── query_page.py     # Build query / Generate SQL / Write SQL, results, review dialog (§8.3)
+│           ├── data_page.py      # Table grid, data editor, table-designer dialogs (§8.8, §8.9)
 │           ├── ingest_page.py    # Upload + schema review + row review
 │           ├── admin_page.py     # Users, grants, audit log viewer
 │           ├── analyze_page.py   # Charts, analytics, forecasting, explanations (§8.7)
-│           └── components.py     # Shared widgets (SQL preview, behind-the-scenes panel, export buttons)
+│           └── components.py     # Shared widgets (SQL preview, query-details panel, export buttons)
 ├── tests/
 │   ├── conftest.py               # Temp data dirs, fake LLM client
 │   ├── security/
@@ -144,13 +156,18 @@ coalescedb/
 │   │   ├── test_authorizer.py
 │   │   ├── test_identifiers.py
 │   │   ├── test_db_names.py      # validate_db_name, Windows reserved names (§6.8)
-│   │   └── test_registry_paths.py
+│   │   ├── test_registry_paths.py
+│   │   ├── test_ui_escaping.py   # Data is shown as text, never as HTML (§11.1)
+│   │   └── test_local_server.py  # Bind address, Host/Origin checks, upload cap, UI secret (§11.1)
 │   ├── test_auth.py
 │   ├── test_config.py
 │   ├── test_registry.py          # Create / delete / rename / import lifecycle (§6.3)
 │   ├── test_backup.py            # Snapshot + pruning (§6.7)
 │   ├── test_introspect.py
 │   ├── test_executor.py
+│   ├── test_query_builder.py     # §6.27
+│   ├── test_data_editor.py       # §6.28
+│   ├── test_table_designer.py    # §6.29
 │   ├── test_ingest_tabular.py
 │   ├── test_schema_design.py
 │   ├── test_extraction.py
@@ -188,7 +205,8 @@ coalescedb/
 │       └── ollama/               # Bundled Ollama release, extracted (git-ignored)
 ├── assets/
 │   ├── architecture.md           # Mermaid diagram
-│   └── demo.gif
+│   ├── demo.gif
+│   └── fonts/                    # Geist + JetBrains Mono woff2 and their OFL.txt files (added at M6 with approval)
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                # ruff + pytest (no LLM needed)
@@ -216,6 +234,8 @@ class Settings:
     backups_dir: Path              # data_dir / "backups"
     app_db_path: Path              # data_dir / "app.db"   (users, grants, audit — NOT in databases_dir)
     traces_path: Path              # data_dir / "traces.jsonl"
+    ui_secret_path: Path           # data_dir / "ui_secret"   (NiceGUI storage_secret, §8.6). Added at M6
+    ui_storage_dir: Path           # data_dir / "ui_storage"  (NiceGUI's own storage files, §8.6). Added at M6
 
     ollama_host: str = "http://127.0.0.1:11434"
     # There is no single "ollama_model" setting. After M15, the model in use is decided at
@@ -277,8 +297,9 @@ def load_settings() -> Settings: ...
     # Creates directories with mode 0o700 where the OS supports it.
     # Detects packaged mode via getattr(sys, "frozen", False).
     # COALESCEDB_DATA_DIR, when set, replaces data_dir in both dev and packaged mode (tests
-    # use it to avoid writing into the repo). The five paths derived from data_dir
-    # (databases_dir, backups_dir, app_db_path, traces_path, benchmark_cache_path) always
+    # use it to avoid writing into the repo). The paths derived from data_dir
+    # (databases_dir, backups_dir, app_db_path, traces_path, benchmark_cache_path, and from
+    # M6 ui_secret_path and ui_storage_dir) always
     # follow it and cannot be overridden one by one.
     # A value that can't be converted to the field's type raises ValueError naming the
     # variable (never repeating the value). An empty model_ladder raises ValueError.
@@ -309,6 +330,8 @@ class SQLRejected(CoalesceDBError): ...               # Guard rejected; .reasons
 class SQLParseError(SQLRejected): ...
 class QueryTimeout(CoalesceDBError): ...
 class ExecutionError(CoalesceDBError): ...            # Wraps sqlite3.Error; .sqlite_message
+class RowConflict(CoalesceDBError): ...               # apply_changes (§6.6): a row was changed or removed
+                                                      # after it was loaded; .statement_index: int. Added at M5
 
 class LLMUnavailable(CoalesceDBError): ...            # Ollama not reachable / model missing
 class LLMOutputInvalid(CoalesceDBError): ...          # Failed validation after retries; .raw_output
@@ -414,7 +437,7 @@ class AIStatus:
     enabled: bool                # True only when state == "ready"
     active_model: str | None     # The ONLY source of truth for which model the app calls
     pdf_import_enabled: bool     # False if prompt_tps below threshold even when AI is on
-    reason: str                  # Human-readable, shown in the sidebar
+    reason: str                  # Human-readable, shown in the status bar (§8.2)
     results: list[BenchmarkResult]
     pending_downloads: list[tuple[str, int]]   # (model name, size in bytes) awaiting consent
     download_progress: tuple[int, int] | None  # (bytes done, total) while downloading
@@ -547,6 +570,32 @@ After the permission check (so a non-superadmin learns nothing), `delete_user`, 
 `grant`, `revoke`, `revoke_all`, `rename_grants` and `role_for` validate every database name with `validate_db_name()` (defined in `db/identifiers.py`, §6.8: `DB_NAME_RE.fullmatch()` plus the Windows reserved names) and raise `InvalidIdentifier` for a bad name. The name is also only ever passed as a bound parameter.
 
 `grant` does not check that the database exists (AuthService cannot see the files), so a grant row can exist for a name before any database does. The registry clears such stray rows with `revoke_all` whenever a name comes into use (§6.3).
+
+**UI preferences (added at M6).** Dark mode is stored per user in `app.db`, in its own table so the M2 `users` table is unchanged:
+
+```sql
+CREATE TABLE user_prefs (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  dark_mode TEXT NOT NULL DEFAULT 'auto' CHECK (dark_mode IN ('auto','light','dark'))
+);
+```
+
+```python
+    def get_user(self, user_id: int) -> User | None: ...
+        # Read-only lookup by id for the UI's per-page and per-action re-load (§8.1).
+        # Same reload rule as every other AuthService method: it reads app.db on each
+        # call and never returns a cached object, so a deleted user is not returned
+        # (None), and is_superadmin is always the stored value. Takes no actor: it returns nothing a signed-in page
+        # does not already hold, and the id comes from server-side storage, never from
+        # a form. Not audited.
+    def get_dark_mode(self, user: User) -> Literal["auto", "light", "dark"]: ...
+        # Re-loads the user like every other method. No row → "auto" (follow the system).
+    def set_dark_mode(self, actor: User, mode: Literal["auto", "light", "dark"]) -> None: ...
+        # A user can only change their own preference. Any other value → ValueError.
+        # Bound parameters only. Not audited (it is not a security event).
+```
+
+It is kept here, not in NiceGUI's browser storage, because that storage follows a browser cookie rather than the app user, and the desktop window does not keep cookies between launches (§8.1). The login page, where no user is known yet, uses `auto`. The second preference, reduced transparency, is per install (§8.2).
 
 > **Note on the "role toggle" from the original idea:** a sidebar toggle that lets the user *pick* Admin or Viewer is a demo, not RBAC. In this spec the role is derived from the logged-in user's grant. For portfolio demos, seed two accounts (`demo_admin`, `demo_viewer`) and show switching between them.
 
@@ -706,11 +755,11 @@ def sample_rows(path: Path, table: str, n: int = 3) -> list[dict]: ...
 
 ### 6.6 Executor — `db/executor.py`
 
-The only class in the app that runs SQL against user databases. Every feature (manual SQL, English questions, ingestion, imports, export, analytics) goes through it, so the role checks, guard and audit log apply everywhere.
+The only class in the app that runs SQL against user databases. Every feature (typed SQL, generated SQL, the query builder, the data editor, the table designer, ingestion, imports, export, analytics) goes through it, so the role checks, guard and audit log apply everywhere.
 
 ```python
-Source = Literal["manual_sql", "nl", "ingest", "sql_import", "live_import",
-                 "export", "analyze", "system"]
+Source = Literal["manual_sql", "nl", "builder", "editor", "designer", "ingest",
+                 "sql_import", "live_import", "export", "analyze", "system"]
 
 class Executor:
     def __init__(self, settings: Settings, registry: DatabaseRegistry,
@@ -737,6 +786,26 @@ class Executor:
         # Several DDL statements in ONE transaction (§6.13, §6.15, §6.19). Each statement is
         # guarded individually; one rejection rejects all. Snapshot first if the DB has tables.
 
+    def apply_changes(self, session: Session,
+                      statements: Sequence[tuple[str, Sequence[Any]]], *,
+                      source: Source, confirmed: bool) -> int: ...
+        # Several parameterized DML statements in ONE transaction. Used by the data editor
+        # (§6.28) with the output of compile_changes. Each item is (sql, params).
+        # - Each statement is guarded individually; one rejection rejects all, before
+        #   anything runs.
+        # - Only INSERT, UPDATE and DELETE are accepted. An UPDATE or DELETE that the guard
+        #   marks destructive (no WHERE) is refused outright: SQLRejected. This method has
+        #   no destructive_confirm_text, so it can never run a table-wide write.
+        # - If any statement is a DELETE: backups.snapshot(path, reason="editor_delete")
+        #   before the transaction starts.
+        # - All statements run inside one BEGIN IMMEDIATE ... COMMIT. Every UPDATE and
+        #   DELETE must change exactly one row. If one changes 0 rows (the row was edited or
+        #   removed by someone else since it was loaded, §6.28) or more than one, everything
+        #   is rolled back and RowConflict(statement_index=i) is raised. Any other failure
+        #   also rolls back everything.
+        # - Returns the number of rows changed. One audit entry for the whole batch:
+        #   counts per statement kind, tables, elapsed, source. Never parameter values.
+
     def dry_run(self, session: Session, sql: str) -> None:
         # Home of the §6.11 EXPLAIN check. Resolves role, runs the guard, opens a §6.4
         # connection, and executes `EXPLAIN <normalized_sql>`. Compiles the plan without
@@ -746,7 +815,7 @@ class Executor:
         # still does not run the user's SQL.
 ```
 
-Contract for all three methods:
+Contract for `execute`, `execute_many`, `apply_schema` and `apply_changes`:
 
 1. Re-resolve role from `auth.role_for(session.user, session.db_name)`. **Do not trust `session.role`.** None → `PermissionDenied`.
 2. Guard every statement with `validate(sql, role, known_tables)`; if any is not allowed → audit `query_rejected`, raise `SQLRejected(guard.reasons)`.
@@ -755,7 +824,9 @@ Contract for all three methods:
 5. Open a connection via §6.4 with the resolved role and run `guard.normalized_sql`. **Values are only ever passed through `params` / `rows` as bound parameters** — never formatted into the SQL string.
 6. SELECT row cap: `max_rows` if given, else `max_result_rows`, and never more than `max_export_rows`. Use `fetchmany(cap + 1)` to set `truncated`.
 7. Writes run inside `BEGIN IMMEDIATE ... COMMIT`, rolled back on any exception.
-8. Audit `query` (or `export` / `ingest` / `sql_import` / `live_import` per `source`) with SQL, kind, row_count, elapsed, source. Parameter values are never written to the audit log.
+8. Audit `query` (or `export` / `ingest` / `sql_import` / `live_import` per `source`) with SQL, kind, row_count, elapsed, source. Parameter values are never written to the audit log. Builder, editor and designer statements are audited as `query` with their own `source` value, so the audit log shows where each statement came from.
+
+**Calling from the UI:** every Executor method blocks while SQLite works. NiceGUI runs all users' event handlers on one event loop, so UI code never calls the Executor directly from a handler; it awaits it through `run.io_bound` (a worker thread). The connection is opened and closed inside that call (§6.4), so it never crosses threads.
 
 ### 6.7 Backups — `db/backup.py`
 
@@ -825,6 +896,8 @@ def dedupe(names: list[str]) -> list[str]: ...     # "title","title" → "title"
     # exist, put the existing ones first and keep the tail:
     #   dedupe(existing + new)[len(existing):]
 ```
+
+The visual builder (§6.27–§6.29) uses exactly these two functions and nothing else: names picked in a form are checked against introspection and quoted with `quote_existing_identifier`; names typed for a new table or column go through `to_snake_identifier` and `quote_identifier`. A name typed by the user is therefore never passed to `quote_existing_identifier` as-is: it must first be found in `known`.
 
 Values are always bound with `?` placeholders. Identifiers cannot be bound, so they must go through one of the two quoting functions. `test_identifiers.py` covers both, including existing names with spaces, uppercase letters, keywords (`Order`) and embedded double quotes. It also asserts that `"abc\n"` is rejected by `validate_identifier`, and that `to_snake_identifier` raises `InvalidIdentifier` for `""`, `" "`, `"!!!"`, `"日本"` and an Arabic header.
 
@@ -1026,7 +1099,7 @@ def insert_rows(executor: Executor, session: Session, table: str,
     # Executor.execute_many(..., source="ingest", confirmed=True). One transaction; returns count.
 ```
 
-Flow in UI: upload → choose target DB/tables (or "create new database from this document" → §6.13 first) → extraction runs with progress per chunk → rows shown in `st.data_editor` for correction/deletion → **Insert** button → `insert_rows`.
+Flow in UI: upload → choose target DB/tables (or "create new database from this document" → §6.13 first) → extraction runs with progress per chunk → rows shown in an editable grid (`ui.aggrid`, §8.4) for correction/deletion → **Insert** button → `insert_rows`.
 
 Viewers cannot see the ingest page at all, and `insert_rows` re-checks role regardless.
 
@@ -1105,8 +1178,12 @@ Traced: every LLM call (model, tokens, latency), every guard decision, every exe
 | Import from SQL dump file | ✗ | ✗ | ✓ (into a new database) |
 | Import from live database | ✗ | ✗ | ✓ |
 | Re-run benchmark / change AI mode | ✗ | ✗ | ✓ |
+| Query builder (§6.27) | ✓ (SELECT only) | ✓ | ✓ |
+| Table grid on the Data page (§6.28) | ✓ (read-only) | ✓ | ✓ |
+| Data editor: change, add, delete rows (§6.28) | ✗ | ✓ (review + confirm) | ✓ |
+| Table designer (§6.29) | ✗ | ✓ (review + confirm; typed confirmation for drops and renames) | ✓ |
 
-Every action in this table is audited (§6.1) with action names `export`, `analyze`, `sql_import`, `live_import`, `benchmark`.
+Every action in this table is audited (§6.1) with action names `export`, `analyze`, `sql_import`, `live_import`, `benchmark`; builder, editor and designer statements are audited by the Executor as `query` (§6.6).
 
 ### 6.19 SQL Dump Import — `ingest/sql_import.py`
 
@@ -1240,7 +1317,7 @@ def resolve_ai_status(settings: Settings, client: OllamaClient,
     # No sidecar argument. The worker only talks HTTP to settings.ollama_host
     # (which load_settings reads from COALESCEDB_OLLAMA_HOST). If that host does not
     # answer GET /api/version, set state="ollama_unavailable" — this is what happens
-    # when someone runs `streamlit run app.py` from source without the launcher.
+    # when the launcher found no Ollama to use or start (§9.2 step 5), and in tests.
 def machine_fingerprint(client: OllamaClient, model: str) -> str: ...
 ```
 
@@ -1259,15 +1336,15 @@ def machine_fingerprint(client: OllamaClient, model: str) -> str: ...
    - Skip it if free RAM (`psutil.virtual_memory().available`) is below 1.5× the model's file size (reason recorded).
    - If it isn't installed: set `state="needs_download_consent"`, add it to `pending_downloads` with its size from `KNOWN_MODEL_SIZES` (stock) or `ModelArtifact.size_bytes` (fine-tuned), and **stop the background check there**. The worker thread never tries to show anything itself.
    - Benchmark it. If `gen_tps ≥ benchmark_min_gen_tps`, select it and stop. Before trying the next, smaller model, unload this one (`keep_alive: 0`) to free memory.
-5. If no model passes → AI disabled. Reason example: "AI features need 20 tokens/s; this computer reached 9.4 with the smallest model. Manual SQL, import, export, charts and analytics still work."
+5. If no model passes → AI disabled. Reason example: "AI features need 20 tokens/s. This computer reached 9.4 tokens/s with the smallest model. Query builder, SQL, import, export, charts and analytics still work."
 6. `pdf_import_enabled = enabled and prompt_tps ≥ benchmark_min_prompt_tps and active_model allows it` (see feature gating below).
-7. `force_on` skips the threshold but still benchmarks, and shows an amber "AI may be slow on this computer" badge.
+7. `force_on` skips the threshold but still benchmarks, and shows the amber status text "Model is slow on this computer (<n> tokens/s)".
 
-**When it runs:** in a background thread *after* the window opens, so startup is never blocked. While it runs, the sidebar shows "Checking AI speed…" and all non-AI features are usable. Superadmins have a **Re-run benchmark** button on the Admin page.
+**When it runs:** in a background thread *after* the window opens, so startup is never blocked. While it runs, the status bar shows "Checking model speed…" and all non-AI features are usable. Superadmins have a **Re-run benchmark** button on the Admin page.
 
-**Threading rule (Streamlit):** background threads never call `st.*`. The worker only updates a shared `AIStatus` object (behind a `threading.Lock`, held by the `@st.cache_resource` services object). The sidebar re-reads it on every rerun and uses `@st.fragment(run_every=2)` to refresh while `state` is `checking` or `downloading`.
+**Threading rule (NiceGUI):** background threads never create, change or delete UI elements and never call `ui.notify` or any other `ui.*` function. The worker only updates a shared `AIStatus` object (behind a `threading.Lock`, held by the app-wide services object that `ui/main.py` creates once at startup). The UI polls it: the shell (§8.2) reads `AIStatus` once on every page load and runs a `ui.timer(2.0, ...)` on each open page that copies the current state into the status bar, touching the elements only when the state has changed. The timer callback runs on NiceGUI's event loop in that page's context, which is the only place UI elements may be updated.
 
-**Download consent flow:** when `state == "needs_download_consent"`, the sidebar shows "AI features need a one-time download of <size>" with **Download** and **Not now** buttons. **Download** (a normal button click on the main thread) starts a worker thread that downloads with progress into `download_progress`, then resumes the ladder at step 3. **Not now** sets `state="disabled"` with the reason "Model not downloaded", and offers the button again on the Admin page.
+**Download consent flow:** when `state == "needs_download_consent"`, the model item in the status bar shows "AI features need a one-time download (<size>)." and opens a small panel with **Download model** and **Not now** buttons. **Download model** (a normal button click, handled on the event loop) starts a worker thread that downloads with progress into `download_progress`, then resumes the ladder at step 3. **Not now** sets `state="disabled"` with the reason "Model not downloaded", and offers the button again on the Admin page.
 
 **Machine fingerprint:** SHA-256 of CPU model (`platform.processor()` or, if that is empty, `platform.machine()` — do **not** shell out to `sysctl`; `test_no_code_execution.py` forbids `subprocess` outside `llm/sidecar.py`), total RAM (`psutil`), OS name and version, Ollama version (`GET /api/version`) and the model's digest. **Digest source:** `GET /api/tags` (the list entry for `model` has `digest`). Do not read digest from `POST /api/show`: Ollama 0.33+ often omits it there. GPU name is not included: there's no reliable cross-platform way to read it without extra dependencies, and the model digest + Ollama version already change when the setup changes.
 
@@ -1275,12 +1352,12 @@ def machine_fingerprint(client: OllamaClient, model: str) -> str: ...
 
 | Feature | 1.5B | 0.5B |
 |---|---|---|
-| Ask in English | ✓ | ✓ |
+| Generate SQL | ✓ | ✓ |
 | Plain-English explanations | ✓ | ✓ (number check makes this safe) |
 | PDF → new database (schema design) | ✓ | ✗ by default |
 | PDF → fill rows | ✓ | Only if extraction evals pass the threshold in §11.2 |
 
-**UI when AI is disabled:** the "Ask in English" option is hidden and the Query page opens in "Write SQL"; PDF import tabs show the reason instead of the uploader; explanations show the deterministic text only (§6.26); the sidebar shows an amber badge "Manual mode — AI too slow on this computer" with the reason on hover. AI state lives in `AIStatus` held by the services object; it is not an environment variable.
+**UI when AI is disabled:** the "Generate SQL" mode is hidden and the Query page opens in "Build query" (the builder, §6.27, is the default mode in every case and needs no model; "Write SQL (advanced)" stays available); PDF import tabs show the reason instead of the uploader; explanations show the deterministic text only (§6.26); the status bar shows the amber text "AI features disabled. Model too slow on this computer." with the full reason on hover. AI state lives in `AIStatus` held by the services object; it is not an environment variable.
 
 **`model_store.py`** installs the fine-tuned models from §16:
 ```python
@@ -1490,11 +1567,168 @@ Stored in `app.db` (not in the user database), in a table `column_meta(db_name, 
 - Every warning from §6.24/§6.25 becomes a plain sentence ("There are only 24 rows, so treat these results as a rough guide.").
 - Always appended: "These are associations in your data, not proof that one thing causes another." (Not appended to forecasts; forecasts get the §6.25 rule-7 sentence.)
 
-**LLM step** (only when AI is enabled and the user clicks "Make it simpler"):
+**LLM step** (only when AI is enabled and the user clicks "Simplify wording"):
 1. Send only the `Fact.sentence` list and optional audience (e.g. "for a sales manager") with the §7.4 prompt. **No raw rows are ever sent.**
 2. `is_faithful` rejects the output if: any number in it (regex covering integers, decimals, commas, %, currency, "1.2M"/"3k") doesn't match a number from `Fact.numbers` after normalization; it contains causal claims ("causes", "leads to", "drives", "proves", "guarantees"); or it exceeds 120 words.
 3. If rejected, show only the template explanation and record an `explain_rejected` trace event (without the text).
-4. Display: the AI version labelled "Summary", with the template version always visible below as "Exact figures". Cached per hash of the facts.
+4. Display: the AI version labelled "Summary", with the template version always visible below as "Exact figures". Cached per hash of the facts. Both are shown as plain text (§8, display rule): model output is never rendered as Markdown or HTML.
+
+### 6.27 Query Builder — `builder/query.py`
+
+Lets viewers and admins query by clicking. **The UI never assembles SQL text (§0.10).** The form fills a `QuerySpec`; `compile_query` turns it into one SELECT and a parameter list; the UI passes both to `Executor.execute(..., source="builder")`.
+
+```python
+FilterOp = Literal["equals", "not_equals", "lt", "le", "gt", "ge", "between",
+                   "contains", "starts_with", "ends_with",
+                   "is_empty", "is_not_empty", "is_one_of"]      # Fixed allowlist
+Aggregate = Literal["count", "sum", "average", "min", "max"]
+Scalar = str | int | float | bool
+
+class ColumnRef(BaseModel):
+    table: str
+    column: str
+
+class JoinSpec(BaseModel):          # One foreign key found by introspection
+    fk_table: str                   # The table that holds the foreign-key column
+    fk_column: str
+    ref_table: str                  # The table it points to
+    ref_column: str
+
+class FilterSpec(BaseModel):
+    column: ColumnRef
+    op: FilterOp
+    values: list[Scalar] = Field(default=[], max_length=100)
+        # is_empty / is_not_empty: 0 values; between: 2; is_one_of: 1 to 100; others: 1.
+
+class AggregateSpec(BaseModel):
+    func: Aggregate
+    column: ColumnRef | None = None          # None only with count → COUNT(*)
+
+class SortSpec(BaseModel):
+    column: ColumnRef | None = None          # Exactly one of column / aggregate_index
+    aggregate_index: int | None = None       # Position in QuerySpec.aggregates
+    descending: bool = False
+
+class QuerySpec(BaseModel):
+    table: str
+    columns: list[ColumnRef] = Field(default=[], max_length=200)   # Empty → every column of `table`
+    joins: list[JoinSpec] = Field(default=[], max_length=4)
+    filters: list[FilterSpec] = Field(default=[], max_length=20)
+    match: Literal["all", "any"] = "all"     # AND / OR, one level only
+    group_by: list[ColumnRef] = []
+    aggregates: list[AggregateSpec] = []
+    sort: list[SortSpec] = []
+    limit: int | None = Field(default=None, ge=1)
+
+def available_joins(spec: QuerySpec, tables: list[TableInfo]) -> list[JoinSpec]: ...
+    # Every foreign key (from TableInfo.foreign_keys, §6.5) that links a table already in
+    # the spec to one that is not. This is the only list the UI offers joins from.
+def join_notes(spec: QuerySpec, tables: list[TableInfo]) -> list[str]: ...
+    # One line per join that can repeat rows (see Joins below).
+def compile_query(spec: QuerySpec, tables: list[TableInfo]) -> tuple[str, list[Any]]: ...
+```
+
+`tables` is `list_tables(path)` (§6.5), read in the same operation. Views are not listed there, so the builder works on tables only.
+
+**Validation comes first.** `compile_query` checks the whole spec before it creates any SQL text: an unknown table or column raises `InvalidIdentifier`; an unknown operator or aggregate, a wrong number of values, a join that is not an introspected foreign key, a table used twice, or `columns` given together with `group_by`/`aggregates` raises `ValueError`.
+
+**Identifiers.** Every table and column is written as `"table"."column"`, each part quoted with `quote_existing_identifier` against the names from `tables`. With joins, output columns are aliased `"table.column"` so two `id` columns stay apart; the alias goes through `quote_existing_identifier` too, against the set of `table.column` pairs built from `tables`. Aggregates are aliased with fixed names made by the code (`count_1`, `sum_2`, ...), quoted with `quote_identifier`; the UI shows a readable header ("Sum of total") as a text label.
+
+**Values.** Every value is a `?` parameter, including `LIMIT ?`. The only literal the builder ever writes is the fixed escape character in `ESCAPE '\'`, which is a constant in the code.
+
+| Operator (label in the UI) | SQL | Parameters |
+|---|---|---|
+| equals / not equals | `= ?` / `<> ?` | value |
+| < / <= / > / >= | `< ?` etc. | value |
+| between | `BETWEEN ? AND ?` | low, high |
+| contains | `LIKE ? ESCAPE '\'` | `%` + escaped value + `%` |
+| starts with | `LIKE ? ESCAPE '\'` | escaped value + `%` |
+| ends with | `LIKE ? ESCAPE '\'` | `%` + escaped value |
+| is empty | `(col IS NULL OR col = ?)` | `""` |
+| is not empty | `(col IS NOT NULL AND col <> ?)` | `""` |
+| is one of | `IN (?, ?, ...)` | one per value |
+
+"Escaped value" means `\`, `%` and `_` in what the user typed are each prefixed with `\`, so they match themselves and are not wildcards. (SQLite's `LIKE` ignores case for ASCII letters only; the UI says "ignores case for A to Z" in the operator's hint.) Filters are joined with `AND` (`match="all"`) or `OR` (`match="any"`), one level, no nesting.
+
+**Joins** are only along foreign keys found by introspection, and never typed. The UI lists each one as `orders → customers` (the table holding the key, then the table it points to) and never uses the word "JOIN". A foreign key can be followed in either direction; at most 4 joins; each table appears once. They compile to `LEFT JOIN`, so adding a related table never hides rows of the starting table. When a join goes from the referenced table to the referencing one (starting from `customers`, adding `orders`), a row can repeat; `join_notes` returns one line for it, shown directly under the builder: `Each row of "customers" appears once per matching row of "orders".`
+
+**Grouping.** With `group_by` or `aggregates`, the output is the group columns followed by the aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`. The UI offers sum and average for numeric columns only.
+
+**Result.** The SQL is a single SELECT, so a spec can never compile to a write, whatever the role. It runs through `Executor.execute`, so the guard, the role check, the read-only connection for viewers, the row cap and the audit log all apply. Under each result a **Show SQL** panel displays the compiled SQL read-only, in monospace, as plain text (§8, display rule).
+
+**Out of scope (use Write SQL):** subqueries, unions, window functions, nested AND/OR, joining a table to itself, and joins that are not backed by a foreign key.
+
+**sqlglot check (M22):** the guard re-renders SQL before it runs (§6.2 step 10). `LIKE ? ESCAPE '\'`, `LIMIT ?` and the number and order of `?` placeholders must survive that unchanged. `test_query_builder.py` asserts it. If the installed sqlglot does not round-trip them, STOP and report (CLAUDE.md); do not work around it.
+
+### 6.28 Data Editor — `builder/edits.py`
+
+An editable grid of one table on the Data page (§8.8). Admins of the database can edit; viewers get the same grid read-only. **The UI never assembles SQL text (§0.10).**
+
+```python
+class RowChange(BaseModel):
+    kind: Literal["insert", "update", "delete"]
+    row_id: int | None = None                  # Index into the rows held on the server (update, delete)
+    values: dict[str, Scalar | None] = {}      # Column → new value (insert, update)
+
+def compile_changes(table: str, loaded: Sequence[Mapping[str, Any]],
+                    changes: list[RowChange],
+                    tables: list[TableInfo]) -> list[tuple[str, list[Any]]]: ...
+def describe_changes(table: str, loaded: Sequence[Mapping[str, Any]],
+                     changes: list[RowChange], tables: list[TableInfo]) -> list[str]: ...
+    # One plain-words line per change, for the review dialog.
+```
+
+- **Loading.** The grid is filled by a builder query on the table (§6.27), so filters above the grid work the same way and the row cap applies. The server keeps the loaded rows (`loaded`); the browser only ever sends back a row index and new values. Original values are never taken from the browser.
+- **Primary key required.** A table without a primary key (no `ColumnInfo.pk`) is read-only in the editor, with one line above the grid: "Read-only. This table has no primary key."
+- **Statements.** All parameterized; table and column names from introspection through `quote_existing_identifier`:
+  - update: `UPDATE "t" SET "a" = ? WHERE "id" IS ? AND "a" IS ? AND "b" IS ? ...`
+  - delete: `DELETE FROM "t" WHERE "id" IS ? AND "a" IS ? ...`
+  - insert: `INSERT INTO "t" ("a", "b") VALUES (?, ?)`. Columns left blank are left out, so defaults and `INTEGER PRIMARY KEY` numbering apply.
+  The WHERE clause holds the primary key **and the original value of every loaded column**, compared with `IS ?` (which also matches NULL). So a row that someone else changed after it was loaded matches nothing.
+- **Values.** New values are converted in Python by the column's declared type (integer, real, otherwise text; an empty cell is NULL). A value that cannot be converted is reported on that cell before the review step. Unknown columns raise `InvalidIdentifier`; at most 1,000 changes per apply.
+- **Unsaved changes.** The status bar shows the count ("3 unsaved changes") in the warning colour, always with the text. Leaving the table with unsaved changes asks first.
+- **Review.** Before anything is applied, a dialog lists every change from `describe_changes` in plain words (for example `Row id 42: change "status" from "open" to "closed"`, `Delete row id 7`, `Add 1 row`) and, if rows are deleted, "A backup is taken before rows are deleted." Applying needs a confirm click.
+- **Applying.** `Executor.apply_changes(session, statements, source="editor", confirmed=True)` (§6.6): one transaction, a backup snapshot first if there is any delete, and every update and delete must change exactly one row.
+- **Conflicts.** If a row was changed or removed since it was loaded, `apply_changes` rolls everything back and raises `RowConflict`. The editor shows "Row <key> was changed after it was loaded. Reload the table and apply the edit again." Nothing is overwritten and nothing is partly applied.
+
+**sqlglot check (M23):** `IS ?` must survive the guard's re-render (not become `= ?`). Same STOP rule as §6.27.
+
+### 6.29 Table Designer — `builder/designer.py`
+
+Admins of the database create and change tables by filling forms (§8.9). **The UI never assembles SQL text (§0.10).**
+
+```python
+class CreateTable(BaseModel):  table: TableSpec                       # §6.13 models
+class AddColumn(BaseModel):    table: str; column: ColumnSpec
+class RenameColumn(BaseModel): table: str; column: str; new_name: str
+class RenameTable(BaseModel):  table: str; new_name: str
+class DropColumn(BaseModel):   table: str; column: str
+class DropTable(BaseModel):    table: str
+DesignerOp = CreateTable | AddColumn | RenameColumn | RenameTable | DropColumn | DropTable
+
+def check_designer_op(op: DesignerOp, tables: list[TableInfo]) -> list[str]: ...
+    # Problems that introspection can already see (listed below). Empty list = may proceed.
+def compile_designer_op(op: DesignerOp, tables: list[TableInfo]) -> list[str]: ...
+```
+
+- **Names.** Existing tables and columns must be in `tables` and are quoted with `quote_existing_identifier`. New names are what `to_snake_identifier` makes of the typed text (the form shows the result live, e.g. "Due Date" becomes `due_date`), validated and quoted with `quote_identifier`. A new name that already exists in the table or database (compared without case), or that starts with `sqlite_` or `_app_`, is refused.
+- **Create table:** `compile_ddl([spec], origin="designed")` (§6.13), then `Executor.apply_schema(..., source="designer", confirmed=True)`. Foreign keys can only be set here, when the table is created.
+- **Add column:** `ALTER TABLE "t" ADD COLUMN ...`, with the column definition produced by the same code `compile_ddl` uses for a column (same type mapping, same CHECKs, same literal escaping for defaults; SQLite cannot bind `?` in DDL).
+- **Rename column / rename table / drop column / drop table:** one `ALTER TABLE` or `DROP TABLE` statement each, run with `Executor.execute(..., source="designer", confirmed=True, destructive_confirm_text=...)`.
+- **Confirmation.** Create and add show the statement's effect in plain words and need a confirm click. Drops **and renames** are destructive for the guard (§6.2 step 9), so they need the typed confirmation and take a backup first, exactly as in §6.6. The dialog names the object and says exactly what to type:
+  - `Delete table "orders"? This cannot be undone.`
+  - `Delete column "total" from "orders"? This cannot be undone.`
+  - `Rename table "orders" to "sales_orders"?` / `Rename column "total" to "amount" in "orders"?`
+  - then, in each: `Type the database name "<db_name>" to confirm. A backup is taken first.`
+  The text typed is the database name (§6.6 step 4), not the table name.
+
+**What SQLite supports.** Checked against the SQLite this project runs on (3.53.1 in the project's Python 3.12) and sqlite.org's ALTER TABLE page: `RENAME TO`, `RENAME COLUMN` (SQLite 3.25+), `ADD COLUMN` and `DROP COLUMN` (3.35+) are all available. At startup the app reads `sqlite3.sqlite_version_info`; below 3.35 the drop-column action is disabled with the reason shown. Limits the designer must respect:
+
+- `ADD COLUMN` cannot add a `PRIMARY KEY` or `UNIQUE` column; a `NOT NULL` column needs a default that is not NULL; the default cannot be `CURRENT_TIME`/`CURRENT_DATE`/`CURRENT_TIMESTAMP` or an expression. The form does not offer these combinations.
+- `DROP COLUMN` fails if the column is (part of) the primary key, has a `UNIQUE` constraint, is indexed, is used in a foreign key, or is named in a view, a `CHECK` or a generated column. `check_designer_op` reports the primary-key and foreign-key cases from introspection before anything runs; for the rest, SQLite's own error message is shown (§12).
+- Changing a column's type, and SQLite 3.53's `ALTER COLUMN ... SET/DROP NOT NULL`, are out of scope.
+
+**sqlglot check (M23):** `ALTER TABLE ... RENAME COLUMN`, `RENAME TO`, `ADD COLUMN` and `DROP COLUMN` must parse and re-render correctly in the installed sqlglot, and the guard must classify them as `ALTER_TABLE`. Same STOP rule as §6.27.
 
 ---
 
@@ -1600,86 +1834,181 @@ Columns (name: type): {columns_with_types}
 
 ---
 
-## 8. User Interface — `app.py`, `ui/`
+## 8. User Interface — `ui/`
+
+**All UI work follows `DESIGN.md`: look, layout and wording.** This spec decides behaviour and security. If the two conflict with each other, or with what the installed NiceGUI supports, stop and ask (CLAUDE.md). The UI library is NiceGUI (§1).
+
+**Display rule (security).** Anything that came from a database, a file, a user or the model (cell values, table and column names, file names, usernames, SQLite error text, generated or compiled SQL, model explanations) is shown only through components that escape text: `ui.label`, input values, tooltips, `ui.notify`, and `ui.table` / `ui.aggrid` cells in their default text mode. It is never passed to `ui.html`, `ui.markdown`, `ui.code` (which renders through Markdown), `ui.aggrid(html_columns=...)`, an AG Grid cell renderer, an AG Grid option key starting with `:` (NiceGUI evaluates those as JavaScript), `ui.notify(..., html=True)`, `ui.add_head_html` / `ui.add_body_html`, `ui.run_javascript`, or a table slot that uses `v-html`. To keep this checkable, `ui/` does not use those features at all, for any content. The single exception is `ui/theme.py`, which adds the two global items DESIGN.md §6 allows (the font-face declarations and the colour registration) from constant strings. Charts keep the escaping in §6.23. `test_ui_escaping.py` enforces both halves (§11.1).
+
+**No SQL in the UI (§0.10).** UI code calls `compile_query`, `compile_changes` or `compile_designer_op` (§6.27–§6.29), or passes on SQL the user typed in Write SQL mode or SQL the model proposed in Generate SQL mode (§0.10). It never builds or edits SQL text itself.
+
+**Blocking work.** Every call that can take time (Executor, LLM, file reading, export) is awaited through `run.io_bound` so the event loop, which serves every open page, is never blocked. `run.cpu_bound` is not used (it passes work to another process with pickle); analytics keep the worker process of §6.24.
+
+**Decisions taken where DESIGN.md and NiceGUI meet** (checked against NiceGUI 3.17.1):
+
+- Tailwind `dark:` variants follow `ui.dark_mode()`: NiceGUI's page template ties the `dark` variant to Quasar's `body--dark` class. DESIGN.md §3's check passes.
+- `ui.colors` holds one value per role, but DESIGN.md §3 gives a light and a dark value. `ui/theme.py` registers the light set or the dark set to match the current mode, and calls `ui.colors` again whenever dark mode changes. No stylesheet is used for this.
+- NiceGUI's default font is Roboto. `ui/theme.py` sets the bundled Geist font on `body` and JetBrains Mono through a theme constant (DESIGN.md §4).
+- AG Grid takes its fonts and colours from its own theme. If matching DESIGN.md turns out to need a stylesheet rather than AG Grid's theme options and cell classes, STOP and ask at M6.
 
 ### 8.1 Page Routing — `ui/main.py`
 
 ```python
-def main() -> None:
+def run(*, native: bool, port: int) -> None:           # Called by launcher.py (§9.1)
     settings = load_settings()
-    services = get_services(settings)          # @st.cache_resource: AppStore, AuthService, Registry, Executor, LLM
-    if not services.auth.store.has_any_user(): ui.login.first_run_setup(services); return
-    if (sess := ui.state.current_session()) is None: ui.login.login_page(services); return
-    page = ui.sidebar.render(services, sess)   # returns "query" | "analyze" | "ingest" | "admin"
-    {"query": ui.chat.render, "analyze": ui.analyze_page.render,
-     "ingest": ui.ingest_page.render, "admin": ui.admin_page.render}[page](services, sess)
+    services = build_services(settings)    # Created ONCE per process: AppStore, AuthService,
+                                           # Registry, Executor, LLM client, shared AIStatus
+    server.install(settings)               # Host and Origin checks, upload cap, error handlers (§8.6)
+    theme.install(settings)                # Fonts as local static files, colours (DESIGN.md)
+    register_pages(services)
+    ui.run(**server.run_kwargs(settings, native=native, port=port))    # §8.6
+
+# register_pages defines one function per page with @ui.page:
+#   "/login"   "/setup" (first run)   "/" (Query)   "/data"   "/analyze"   "/import"   "/admin"
 ```
 
-`ui.sidebar.render` only returns pages the user may open (Import: admin of the current DB; Admin: superadmin), and each page re-checks on entry. `ui.state` stores only `user_id` and `db_name` in `st.session_state`; the `User` object and role are re-loaded from `AuthService` on every rerun, so a revoked grant takes effect immediately.
+**Every page checks login and role on entry, every time it is loaded.** Each page function starts with `ui.session.require(services, page=...)`, which:
 
-### 8.2 Sidebar
+1. If `app.db` has no user: sends the browser to `/setup`. Once any user exists, `/setup` always redirects to `/login` (and `bootstrap_superadmin` refuses anyway, §6.1).
+2. Reads `user_id`, `db_name` and `boot_id` from `app.storage.user`. If `user_id` is missing, `boot_id` is not this process's id, or the user no longer exists: clears the storage and sends the browser to `/login`.
+3. Re-loads the `User` from `AuthService` by id (`get_user(user_id)`, a read-only lookup added to §6.1's `AuthService` at M6; it returns `None` for an unknown id) and the role from `role_for(user, db_name)`, and builds the `Session` (§5).
+4. Checks the page's own rule: Import needs admin on the current database; Admin needs superadmin; Query, Data and Analyze need any role on the current database. On failure nothing of the page is rendered; the browser goes to `/` with a notice.
 
-- Signed-in user, logout button, and a "Change password" option for the signed-in user. It asks for the current password and the new one and calls `change_password(user, user.id, new, current_password=current)` (§6.1).
-- Database selector showing only `accessible_databases(user, all_databases=registry.list_databases())`, each with a role badge. The sidebar always passes the registry's list; it only matters for superadmins.
-- Superadmin: "New database" (name input validated live against `DB_NAME_RE`).
-- Schema browser: expandable tables → columns (type, PK/FK icons), row counts.
-- AI status from `AIStatus` (§6.22): green "AI on · <model> · <n> tok/s", grey "Checking AI speed…", amber "Manual mode" with the reason on hover, or red "Ollama not running" with the fix-it message.
-- Navigation: Query · Analyze · Import (admin only) · Admin (superadmin only).
+The same re-load runs at the start of **every event handler that does something** (run, save, confirm, export, switch database), not only on page load, so a revoked grant or a deleted user takes effect on the next click. The Executor and `AuthService` re-check on their own as well (§6.1, §6.6); hiding a page or a button is not a security control.
+
+**What browser storage holds.** `app.storage.user` holds only `user_id`, `db_name` and `boot_id`. Never the `User` object, a role, a password, SQL, or results. NiceGUI keys this storage by a signed browser cookie and keeps the data in a file on the server side, under `settings.ui_storage_dir` (§8.6). It is per browser, not per app user, which is why preferences are not kept there (§6.1, §8.2). Logging out clears it.
+
+**Sign-in ends when the app closes.** `boot_id` is a random value made once per process start. A cookie left in a browser from an earlier run therefore no longer counts as signed in.
+
+### 8.2 Shell — `ui/shell.py`
+
+One shell for every signed-in page, laid out as in DESIGN.md §5. (The login and first-run pages have no shell: one small panel on the window base, with the app name as its title and no tagline.)
+
+**Sidebar (left, collapsible)**
+- Navigation, compact rows at the top: Query · Data · Analyze · Import (admin only) · Admin (superadmin only). Only pages the user may open are listed; each page still re-checks (§8.1).
+- Databases: only `accessible_databases(user, all_databases=registry.list_databases())`, each with a role badge (text, not colour alone). The shell always passes the registry's list; it only matters for superadmins.
+- Superadmin: "New database" (name input validated live with `validate_db_name()`, §6.8).
+- Schema tree: expandable tables → columns (type, PK/FK icons with tooltips), row counts. Clicking a table opens it on the Data page (§8.8). For admins, a table's context menu holds the table-designer actions (§8.9).
+
+**Toolbar (top, about 40 px)**
+- The active database name, then the main actions of the current page (for example the Query page's mode switch).
+- Right side: dark mode toggle, and a user menu with the signed-in username, "Change password", "Reduce transparency" and "Log out". "Change password" asks for the current password and the new one and calls `change_password(user, user.id, new, current_password=current)` (§6.1).
+- Browser mode only (no desktop window, §9.1): the user menu also has "Quit CoalesceDB", which stops the server (`app.shutdown()`).
+
+**Status bar (bottom)**
+- Row count and query time of the current result, the truncation notice (§8.3), and the unsaved-change count (§6.28). Real values only.
+- If the server's bind host is not `127.0.0.1` (§8.6): a permanent warning, in the warning colour with the text "Listening on <host>. Other computers can reach this app." It is shown on every page, to every user, and has no close button.
+- Model state from `AIStatus` (§6.22), always as text plus a colour: "Model ready · <model> · <n> tokens/s" (positive); "Checking model speed…" (info); "AI features disabled" with the reason on hover (warning); "Model unavailable. AI features disabled." (negative), with the detail on hover: "Ollama is not running at <host>. Start Ollama, then choose Re-run benchmark." The download consent panel (§6.22) opens from this item. It is refreshed by a `ui.timer` (§6.22 threading rule).
+
+**Inspector (right, optional, collapsible)**: page-specific tabs, for example Query details, Quick chart and History on the Query page (§8.3), and the Explain result panel on the Analyze page (§8.7).
+
+**Preferences**
+- **Dark mode:** per user, stored in `app.db` (`user_prefs`, §6.1). Values `auto` (follow the system), `light`, `dark`. Applied with `ui.dark_mode()` on every page load; the toolbar toggle calls `set_dark_mode`. The login page uses `auto`.
+- **Reduced transparency:** per install, because it depends on the computer, not the person. Stored as one boolean in NiceGUI's general storage (`app.storage.general`, a file in `settings.ui_storage_dir`). Any signed-in user can switch it from the user menu. When on, `ui/theme.py` hands out the solid versions of the panel styles (DESIGN.md §2); no blur class is used anywhere.
 
 ### 8.3 Query Page
 
-- Mode switch: **Ask in English** / **Write SQL**.
-- `st.chat_input` for the prompt; history rendered as chat messages for this DB.
-- For each generation: SQL shown in a code block with a verdict chip (Allowed / Needs confirmation / Destructive / Rejected + reasons).
-- SELECT: auto-runs and renders `st.dataframe`, with "Showing first 1,000 rows" when truncated.
-- Under every SELECT result: **Export CSV**, **Export Excel** (§6.21, full result up to `max_export_rows`), **Quick chart** (expander showing the first `suggest_charts` result with an edit form), and **Analyze →** which opens the Analyze page with this query loaded.
-- "Ask in English" is hidden when `AIStatus.enabled` is False (§6.22).
-- Writes: **review drawer** (`st.expander` opened) with the SQL, tables touched and a **Run** button. Destructive writes add a text input: "Type `<db_name>` to confirm" and a note that a backup will be taken.
-- **Behind the scenes** panel (collapsed by default): prompt token count, completion tokens, LLM latency, execution latency, attempts (self-correction), guard reasons.
+Three modes, switched in the toolbar:
+
+| Mode | Available | What it does |
+|---|---|---|
+| **Build query** (default) | Always, for viewers and admins | Query builder (§6.27) |
+| **Generate SQL** | Only when `AIStatus.enabled` (§6.22); hidden otherwise | English question → SQL through the model (§6.11) |
+| **Write SQL (advanced)** | Always | Typed SQL |
+
+- **Build query:** table picker, column checklist, related tables listed as `orders → customers`, group and sort controls. Filter controls sit directly above the results grid. **Run query** is attached to the builder. The `join_notes` lines (§6.27) appear directly under the builder. Under each result, a **Show SQL** panel shows the compiled SQL read-only in monospace.
+- **Generate SQL:** one input attached to the SQL editor. The generated SQL appears in the editor with a verdict chip (Allowed / Needs confirmation / Destructive / Rejected, plus the reasons as text).
+- **Write SQL (advanced):** the SQL editor with **Run query** attached to it.
+- There is no chat transcript. **History** for this database and this session is a list in the inspector; choosing an entry loads it back into the mode it came from.
+- SELECT: runs and fills a read-only results grid. When truncated, the status bar shows "First 1,000 rows shown. Export for the full result." (with the real cap).
+- At the bottom edge of every SELECT result: **Export CSV**, **Export Excel** (§6.21, full result up to `max_export_rows`). **Quick chart** (inspector tab showing the first `suggest_charts` result with an edit form) and **Analyze result**, which opens the Analyze page with this query loaded.
+- Writes: a **review dialog** with the SQL, the tables touched and a **Run statement** button. Destructive writes add a text input labelled `Type the database name "<db_name>" to confirm.` and the note "A backup is taken first."
+- **Query details** (inspector tab): prompt token count, completion tokens, LLM latency, execution latency, attempts (self-correction), guard reasons.
 
 ### 8.4 Import Page (admins)
 
-Tabs: **PDF → new database**, **PDF → fill existing tables**, **Spreadsheet**, **Templates**, **SQL dump** (superadmin; §6.19), **Live database** (superadmin, only if the extra is installed; §6.20). The SQL dump tab shows the detected dialect (changeable), the planned tables with warnings, and the skipped-statement list before anything is created. Each follows: upload → preview extracted text or sheet → proposal/extraction → editable review (`st.data_editor`) → confirm → result summary with counts and link back to the Query page.
+Tabs: **PDF to new database**, **PDF to existing tables**, **Spreadsheet**, **Templates**, **SQL dump** (superadmin; §6.19), **Live database** (superadmin, only if the extra is installed; §6.20). The SQL dump tab shows the detected dialect (changeable), the planned tables with warnings, and the skipped-statement list before anything is created. Each follows: upload → preview extracted text or sheet → proposal/extraction → editable review (an editable `ui.aggrid`) → confirm → result summary with counts and link back to the Query page. Extracted document text in the preview is shown as plain text (display rule above). Uploads are limited on the server, not only in the browser (§8.6).
 
 ### 8.5 Admin Page (superadmins)
 
 Users (create, reset password, delete), grants matrix (user × database → none/viewer/admin), backups (list, restore), audit log (filter by user/db/action; export CSV).
 
-### 8.6 `.streamlit/config.toml`
+### 8.6 Server Settings — `ui/server.py`
 
-```toml
-[server]
-address = "127.0.0.1"
-headless = true
-enableCORS = true
-enableXsrfProtection = true
-maxUploadSize = 25
-fileWatcherType = "none"
+NiceGUI has no config file; everything is passed to `ui.run` or installed on the app. These settings are security-relevant and are covered by `test_local_server.py` (§11.1).
 
-[browser]
-gatherUsageStats = false
-serverAddress = "127.0.0.1"
-
-[global]
-developmentMode = false
-
-[client]
-showErrorDetails = false
-toolbarMode = "minimal"
+```python
+def run_kwargs(settings: Settings, *, native: bool, port: int) -> dict[str, Any]:
+    return dict(
+        host=bind_host(),               # "127.0.0.1". Always passed: NiceGUI's default outside
+                                        # native mode is "0.0.0.0"
+        port=port,                      # A free port on 127.0.0.1, chosen by the launcher
+        native=native,                  # Desktop window through pywebview (§9.1)
+        show=not native,                # Browser mode opens the default browser
+        reload=False,                   # No auto-reload, no file watcher. Also required when packaged
+        show_welcome_message=False,
+        title="CoalesceDB",
+        dark=None,                      # Each page sets it with ui.dark_mode (§8.2)
+        fastapi_docs=False,             # No /docs or /openapi.json
+        storage_secret=load_or_create_ui_secret(settings),
+        session_middleware_kwargs={"same_site": "strict",
+                                   "session_cookie": "coalescedb_session"},
+        uvicorn_logging_level="warning",
+    )
+    # on_air is never passed: NiceGUI's remote-access feature stays off.
+    # In native mode the launcher also sets the window size (1280x800) through app.native.
 ```
+
+Controls installed by `server.install(settings)` and `run_kwargs`:
+
+1. **Bind address.** `127.0.0.1` only (§0.6). `bind_host()` returns `127.0.0.1` unless `COALESCEDB_BIND_HOST` is set, which only the Docker image does (§9.4); nothing in the app or launcher sets it. With neither `COALESCEDB_BIND_HOST` nor `COALESCEDB_PORT` set, the host is `127.0.0.1`. Whenever the bind host is anything else, the status bar shows a permanent warning that cannot be dismissed (§8.2).
+2. **Host check.** Starlette's `TrustedHostMiddleware` with `allowed_hosts=["127.0.0.1", "localhost"]`. A request whose `Host` header names anything else is refused (400). This stops DNS rebinding, where a web page reaches the app under its own domain name.
+3. **Origin check.** A small ASGI middleware refuses (403) the WebSocket handshake and every non-GET request whose `Origin` header is present and is not this app's own address (`http://127.0.0.1:<port>` or `http://localhost:<port>`). NiceGUI's socket accepts any origin by itself (`cors_allowed_origins='*'`), so another website open in the user's browser could otherwise try to drive it.
+4. **Cookie.** The session cookie is signed with `storage_secret`, HttpOnly, `SameSite=Strict`, and has its own name so it cannot clash with another local app's cookie.
+5. **Upload limit.** NiceGUI's `ui.upload` size limits are checked in the browser only. So a middleware refuses (413) any request whose `Content-Length` is above `max_upload_mb` (plus 1 MB for form overhead), and refuses (411) a body with no declared length, before the body is parsed. `ui.upload` also gets `max_file_size` for quick feedback, and §6.12 checks the actual size again before reading the file.
+6. **UI secret.** `load_or_create_ui_secret` reads `settings.ui_secret_path`; if the file is missing it writes 32 random bytes (`secrets.token_urlsafe(32)`) with owner-only permissions (0600 where the OS supports it). Generated once per install, kept in `data_dir`, never in the repo, never logged.
+7. **Sign-in ends on close** (`boot_id`, §8.1).
+8. **Storage location.** `NICEGUI_STORAGE_PATH` is set to `settings.ui_storage_dir` by the launcher before NiceGUI is imported, so NiceGUI never writes its default `.nicegui` folder into the working directory.
+9. **Error details hidden.** NiceGUI's default error page prints the exception's message. `server.install` replaces it: `@app.on_page_exception` and `ui.on_exception` / `app.on_exception` show the §12 messages instead, and log only the exception class and a trace ID.
+
+No Content-Security-Policy is set: NiceGUI needs inline scripts and runtime templates, so a strict one would break it. The display rule above is the control against HTML injection.
+
+**What is left (accepted, recorded in §10):** another program running as the same OS user can read `data_dir` directly, and another OS user on the same computer can open the port and reach the login page. The login, the lockout and the file permissions are the controls there.
 
 ### 8.7 Analyze Page
 
-Input: the current query (from the Query page's **Analyze →** button) or a table picked from a dropdown. Runs as a SELECT through `Executor`, so the same role rules apply. Notices from `to_frame` (sampling, type guesses) are shown at the top, along with a **Column labels & units** editor (§6.26).
+Input: the current query (from the Query page's **Analyze result** button) or a table picked from a dropdown. Runs as a SELECT through `Executor`, so the same role rules apply. Notices from `to_frame` (sampling, type guesses) are shown at the top, along with a **Column labels & units** editor (§6.26).
 
 Tabs:
-1. **Chart:** chart-type picker with icons (like Excel's Insert Chart), then X, Y, color, aggregation, sort and top-N fields. Live Plotly preview. Buttons: **Save PNG**, **Save SVG**, **Save PDF** (via `render_static`). Optional "Describe the chart you want" box when AI is on.
+1. **Chart:** chart-type picker with icons (like Excel's Insert Chart), then X, Y, color, aggregation, sort and top-N fields. Live Plotly preview. Buttons: **Save PNG**, **Save SVG**, **Save PDF** (via `render_static`). Optional "Describe chart" box when the model is available.
 2. **Summary:** `profile` as a table with small histograms; missing-value and outlier highlights.
 3. **Relationships:** correlation heatmap + top pairs list.
 4. **Model:** pick Linear / Logistic / Clusters, choose target and features with checkboxes, **Run**. Shows metrics, coefficient table with confidence intervals, diagnostic charts, warnings. Admins get **Save predictions as table** / **Save cluster labels as table**.
 5. **Forecast:** pick date and value columns, frequency, horizon (slider capped by the rule in §6.25), method. Shows history + forecast with shaded 80%/95% bands, backtest error vs naive baseline, warnings.
 
-Every result tab has an **Explain** panel: the deterministic explanation is always shown; a **Make it simpler** button (AI on only) adds the §6.26 LLM summary, with an optional audience box. A **Download report (PDF)** button combines the chart, key tables and explanation into one PDF using matplotlib's `PdfPages`.
+Every result tab has an **Explain result** panel in the inspector (§8.2): the deterministic explanation is always shown; a **Simplify wording** button (only when the model is available) adds the §6.26 LLM summary, with an optional audience box. Both texts are shown as plain text (§8 display rule). An **Export report (PDF)** button combines the chart, key tables and explanation into one PDF using matplotlib's `PdfPages`.
+
+### 8.8 Data Page
+
+Opened from the navigation or by clicking a table in the schema tree. Shows one table in a grid (§6.28).
+
+- Toolbar: the table name, its row count, **Add row**, **Save changes** (the one primary button, enabled only with unsaved changes), **Discard changes**, **Reload**. Filter controls (the builder's filter row, §6.27) sit directly above the grid; export and paging at its bottom edge.
+- Column headers show the name with the type beside it; primary-key and foreign-key markers have tooltips.
+- Viewers: the same grid, read-only; the editing buttons are not rendered, and `apply_changes` would refuse them anyway (§6.6).
+- Admins: cells are editable; changed cells, added rows and rows marked for deletion are marked with text or an icon as well as colour. The status bar shows "3 unsaved changes" (real count) in the warning colour.
+- A table without a primary key: read-only, with "Read-only. This table has no primary key." above the grid.
+- **Save changes** opens the review dialog (§6.28): every change in plain words, the backup note if rows are deleted, **Cancel** left of **Apply changes**.
+- A conflict shows the §6.28 message and keeps the unsaved edits on screen so nothing typed is lost.
+
+### 8.9 Table Designer
+
+Admins only (§6.29). Entry points: **New table** at the top of the schema tree, and a table's or column's context menu in the schema tree (Add column, Rename, Delete).
+
+- **New table:** a dialog with the table name and a small grid of columns (name, type from the fixed `ColumnType` list, required, default, allowed values), the primary key choice (default: an automatic `id`), and optional links to other tables, picked from lists of existing tables and columns. Names are shown as they will be stored (the `to_snake_identifier` result) while typing.
+- **Add column / Rename:** a small dialog with the same fields for one column, or one name field.
+- Before running, each dialog states the effect in plain words and, for drops and renames, uses the §6.29 wording with the typed database name. Destructive buttons are never the primary colour (DESIGN.md §3).
+- Problems found by `check_designer_op` are listed in the dialog and disable the confirm button; an error from SQLite is shown in monospace with what to do next (§12).
+- After a change the schema tree and any open grid reload from introspection.
 
 ---
 
@@ -1687,48 +2016,46 @@ Every result tab has an **Explain** panel: the deterministic explanation is alwa
 
 ### 9.1 Launcher — `launcher.py`
 
-Streamlit installs signal handlers, which Python only allows on the **main thread**, and pywebview also needs the main thread (especially on macOS). So Streamlit can't run in a thread; it runs in a **child process**. The same executable plays both roles, chosen by a command-line flag:
+NiceGUI runs the web server in the main process and, in native mode, opens the pywebview window in a separate process that it starts itself; when the window closes it shuts the server down. So the app does not need a second copy of itself as a server process. There is one entry point, used both packaged and from source:
 
 ```python
 def main() -> None:
-    multiprocessing.freeze_support()          # Required for analytics workers in a PyInstaller build
-    if "--serve" in sys.argv:                 # Child process: run the Streamlit server
-        serve(port=int(sys.argv[sys.argv.index("--serve") + 1]))
-        return
-    run_launcher()                            # Parent process: sidecar, child, window
-
-def serve(port: int) -> None:
-    os.environ["MPLBACKEND"] = "Agg"
-    from streamlit.web import cli as stcli
-    sys.argv = ["streamlit", "run", str(resource_path("app.py")),
-                "--server.port", str(port), "--server.address", "127.0.0.1",
-                "--server.headless", "true", "--global.developmentMode", "false"]
-    sys.exit(stcli.main())                    # Runs on this process's main thread
-
-def run_launcher() -> None:
     settings = load_settings()
-    port = find_free_port()                   # 127.0.0.1 only
-    sidecar = OllamaSidecar(settings); sidecar.ensure_running()   # §9.2, non-fatal on failure
-    os.environ["COALESCEDB_OLLAMA_HOST"] = sidecar.effective_host
-    child = subprocess.Popen(child_command(port), env=os.environ)
+    os.environ["MPLBACKEND"] = "Agg"
+    os.environ["NICEGUI_STORAGE_PATH"] = str(settings.ui_storage_dir)   # Before NiceGUI is imported (§8.6)
+    sidecar = OllamaSidecar(settings); sidecar.ensure_running()         # §9.2, non-fatal on failure
+    os.environ["COALESCEDB_OLLAMA_HOST"] = sidecar.effective_host       # load_settings() in ui.main reads it
+
+    from nicegui import app
+    from coalescedb.ui import main as ui_main      # Imported here, after the environment is set
+    app.on_shutdown(sidecar.stop)                  # Only stops a process this sidecar started
+    native = pywebview_available() and "--browser" not in sys.argv
     try:
-        wait_until_http_ok(f"http://127.0.0.1:{port}/_stcore/health", timeout_s=30)
-        open_window_or_browser(f"http://127.0.0.1:{port}")   # pywebview on main thread; blocks until closed
+        ui_main.run(native=native, port=find_free_port())    # 127.0.0.1 only; blocks until the app exits
+                                                             # (COALESCEDB_PORT, set only by Docker, replaces the free port; §9.4)
     finally:
-        child.terminate(); child.wait(timeout=10)
-        sidecar.stop()
+        sidecar.stop()                             # Safe to call twice
 
-def child_command(port: int) -> list[str]: ...
-    # Frozen (PyInstaller): [sys.executable, "--serve", str(port)]  — sys.executable is the app itself
-    # Source:               [sys.executable, str(Path(__file__)), "--serve", str(port)]
-    # Note: "python -m streamlit" does NOT work in a frozen app, which is why the app re-launches itself.
+if __name__ == "__main__":
+    multiprocessing.freeze_support()   # FIRST statement in the main guard: NiceGUI's window process
+                                       # and the analytics workers would otherwise re-launch the app
+                                       # in an endless loop in a PyInstaller build
+    main()
 
+def pywebview_available() -> bool: ...        # try: import webview. NiceGUI itself exits the
+                                              # process if native=True and pywebview is missing,
+                                              # so the launcher checks first
 def resource_path(rel: str) -> Path: ...      # Handles sys._MEIPASS when frozen
 ```
 
-**Source development:** `streamlit run app.py` bypasses `launcher.py` and does not start the sidecar. `load_settings()` then uses `COALESCEDB_OLLAMA_HOST` if set, else the default `http://127.0.0.1:11434`. `resolve_ai_status` has no sidecar object; if that host does not answer, `state = "ollama_unavailable"` and non-AI features still work. To test a dynamic sidecar port from source, run `python launcher.py` rather than `streamlit run`.
+Rules:
 
-If pywebview isn't available, `open_window_or_browser` opens the default browser and the launcher waits until the child exits or the user quits from a small tray/console prompt.
+- **Nothing with side effects at import time.** NiceGUI's window process and the analytics worker processes import the main module again. Starting the sidecar, choosing a port and calling `ui.run` happen only inside `main()`, under the main guard.
+- **Ollama host handoff** is unchanged: the launcher puts the sidecar's address in `COALESCEDB_OLLAMA_HOST`, and `load_settings()` reads it. `resolve_ai_status` never receives the sidecar object (§6.22).
+- **Desktop window:** `ui.run(native=True)` with a 1280x800 window. Closing the window ends the app.
+- **Browser mode** (pywebview not installed, or `--browser`): `native=False, show=True` opens the default browser. Closing the tab does not end the app, so the user menu has "Quit CoalesceDB" (§8.2), and Ctrl+C works in a terminal.
+- **Source development:** `python launcher.py` (or `python launcher.py --browser`). There is no separate `app.py`. If no Ollama can be found or started, `effective_host` stays `settings.ollama_host`, `resolve_ai_status` sets `state = "ollama_unavailable"`, and every non-AI feature still works.
+- Auto-reload is never used, in development either (`reload=False`, §8.6): restart the launcher after a code change.
 
 ### 9.2 Ollama Sidecar — `llm/sidecar.py`
 
@@ -1746,11 +2073,11 @@ class OllamaSidecar:
         # 4. Model installation is NOT done here. resolve_ai_status (§6.22) runs in a
         #    background thread after the window opens and installs models on demand through
         #    model_store.ensure_model (fine-tuned GGUF, checksum-verified) or /api/pull
-        #    (stock models), with consent and a progress bar. The Streamlit child learns the
+        #    (stock models), with consent and a progress bar. The UI learns the
         #    host only via COALESCEDB_OLLAMA_HOST (§9.1); resolve_ai_status does not receive
         #    this sidecar object.
         # 5. If no binary is available: return status with instructions; the app still runs
-        #    with manual SQL, spreadsheet import and all non-LLM features.
+        #    with the query builder, typed SQL, spreadsheet import and all non-LLM features.
         #    effective_host remains settings.ollama_host (which will fail health checks).
     def stop(self) -> None: ...     # Only stops a process this sidecar started
 ```
@@ -1760,21 +2087,22 @@ class OllamaSidecar:
 ### 9.3 PyInstaller — `packaging/coalescedb.spec`
 
 - Entry: `launcher.py`, `--onedir`, windowed (no console) in release builds.
-- `collect_all("streamlit")`, `copy_metadata("streamlit")`, `collect_data_files("sqlglot")`, `copy_metadata` for `pydantic`, `argon2-cffi`, `pypdf`, `openpyxl`.
+- `collect_all("nicegui")` (NiceGUI's templates, static files, bundled fonts and element scripts are data files; this is what its `nicegui-pack` wrapper adds for you), `collect_all("webview")` for pywebview and its platform backends, `collect_data_files("sqlglot")`, `copy_metadata` for `pydantic`, `argon2-cffi`, `pypdf`, `openpyxl`.
 - Version 2: `collect_submodules("sklearn")`, `collect_submodules("statsmodels")`, `collect_submodules("scipy")`, `collect_data_files("plotly")`, `collect_data_files("matplotlib")`, `copy_metadata("xlsxwriter")`. Set `MPLBACKEND=Agg` in the launcher. Exclude `tkinter`, `IPython`, `torch` and anything from `training/` to keep size down.
 - Smoke test after every build: launch the built app, run one chart export (PNG and PDF), one regression and one forecast. Missing hidden imports in scientific libraries usually only show up when a feature is first used.
 - **Making PyInstaller see all imports:** PyInstaller only bundles libraries it finds by following `import` statements from the entry script, and it doesn't look inside files listed as data. So:
-  - `pathex=["src"]`, and `launcher.py` does `import coalescedb.ui.main` (unused at runtime in the parent, but it makes PyInstaller follow every import in the app).
+  - `pathex=["src"]`, and `launcher.py` imports `coalescedb.ui.main` inside `main()` (§9.1); PyInstaller follows imports inside functions too, so it reaches every import in the app.
   - `hiddenimports += collect_submodules("coalescedb")` as a second safety net.
-  - `app.py` is still shipped as a data file, because Streamlit runs it from disk, but it contains only `from coalescedb.ui.main import main; main()`.
-- `datas`: `app.py`, `.streamlit/config.toml`, `resources/ollama/**` (full build only). The `coalescedb` package itself is bundled as code, not data.
-- Build check: after building, run `dist/CoalesceDB/CoalesceDB --serve 8599` from a terminal and load every page once; an `ImportError` there means a missing hidden import.
+  - There is no `app.py` data file any more: NiceGUI does not run a script from disk.
+- `datas`: `assets/fonts/**` (the Geist and JetBrains Mono woff2 files with both `OFL.txt` licence texts; added at M6 with approval), `resources/ollama/**` (full build only). The `coalescedb` package itself is bundled as code, not data. `ui/theme.py` finds the fonts through `resource_path` and serves them with `app.add_static_files`.
+- `multiprocessing.freeze_support()` stays the first statement in the launcher's main guard (§9.1). `reload=False` is required in a packaged NiceGUI app (§8.6).
+- Build check: after building, run `dist/CoalesceDB/CoalesceDB --browser` from a terminal and load every page once; an `ImportError` there means a missing hidden import. Then start it normally and check that the desktop window opens and that closing it ends the process and the sidecar.
 - Output: `dist/CoalesceDB/` → zipped for Windows; `.app` then `.dmg` on macOS.
 - Code signing is out of scope for v1; README explains the Windows SmartScreen / macOS Gatekeeper prompt.
 
 ### 9.4 Docker (optional, for reviewers)
 
-`docker-compose.yml` with `ollama/ollama` and the app container; an init step pulls the model. App container sets `COALESCEDB_OLLAMA_HOST=http://ollama:11434` and binds Streamlit to `0.0.0.0` *inside* the container only, with the port published to `127.0.0.1:8501` on the host.
+`docker-compose.yml` with `ollama/ollama` and the app container; an init step pulls the model. App container sets `COALESCEDB_OLLAMA_HOST=http://ollama:11434` runs `python launcher.py --browser`, and sets `COALESCEDB_BIND_HOST=0.0.0.0` and `COALESCEDB_PORT=8080` so NiceGUI listens on `0.0.0.0` *inside* the container only, with the port published to `127.0.0.1:8080` on the host. These two variables are read only by `ui/server.py` and the launcher, and only the Docker image sets them (§8.6). The Host and Origin checks stay on.
 
 ---
 
@@ -1797,7 +2125,7 @@ Each item maps to a test in §11.1.
 | S11 | Reaching app metadata (users, grants) through user SQL | Separate `app.db` never opened by user connections |
 | S12 | Runaway query / huge result | Progress-handler timeout, row cap (§6.4, §6.6) |
 | S13 | Malicious/oversized uploads | Size, page and row caps; encrypted/scanned rejection; formulas not evaluated (§6.12) |
-| S14 | Remote access to the app | Bound to 127.0.0.1; XSRF on (§8.6) |
+| S14 | Remote access to the app | Bound to 127.0.0.1, passed explicitly to `ui.run`; no auto-reload, no On Air (§8.6) |
 | S15 | Sensitive data in logs | Traces store lengths/hashes, not content (§6.17) |
 | S16 | Data-modifying CTE disguised as SELECT | Deep walk for write nodes under SELECT roots (§6.2 step 6) |
 | S17 | Malicious SQL dump (DROP, ATTACH, triggers, procedures) | Dump SQL is never executed: only parsed; DDL rebuilt by `compile_ddl`; values bound as parameters; non-literal values reject the row (§6.19) |
@@ -1811,6 +2139,15 @@ Each item maps to a test in §11.1.
 | S25 | Analytics freezing the app (huge data, slow fits) | Row caps with sampling, chart point cap, worker process killed after timeout (§6.23–6.24) |
 | S26 | HTML/script injection through column names in charts | Labels escaped before reaching Plotly (§6.23) |
 | S27 | Personal data ending up in a trained model | Training uses only public datasets and synthetic data; the app has no telemetry and never collects user data for training (§16) |
+| S28 | HTML/script injection through data shown in the UI (cell values, names, file names, error text, model output) | Display rule: text-escaping components only; no `ui.html`, `ui.markdown`, AG Grid HTML columns or renderers anywhere in `ui/` (§8) |
+| S29 | A web page in the user's browser reaching the local server (DNS rebinding, cross-site WebSocket or POST) | Host allowlist, Origin check on the socket handshake and on non-GET requests, `SameSite=Strict` cookie (§8.6) |
+| S30 | Oversized upload sent past the browser-side limit | Server-side body cap before parsing, and a size check before reading (§8.6, §6.12) |
+| S31 | Forged or left-over session cookie | Cookie signed with a per-install secret (0600, in `data_dir`); storage holds only ids; sign-in ends when the app closes; user and role re-loaded on every page load and action (§8.1, §8.6) |
+| S32 | SQL injection through the query builder, data editor or table designer | The UI never assembles SQL: typed specs, names only from introspection through the quoting functions, every value a `?` parameter, then the full Executor path (§0.10, §6.27–§6.29) |
+| S33 | Data editor overwriting another user's change, or applying half a batch | Original values in every WHERE; exactly-one-row rule; one transaction; backup before deletes (§6.6 `apply_changes`, §6.28) |
+| S34 | Error messages showing internals or data | NiceGUI's default error page replaced; unexpected errors show only the exception class and a trace ID (§8.6, §12) |
+
+**Accepted limits of a local web UI:** another program running as the same OS user can read `data_dir` directly, and another OS user on the same computer can open the port and reach the login page. The login, the lockout (§6.1) and the owner-only permissions on `data_dir` are the controls for those cases; the app does not try to defend against software already running as the user.
 
 ---
 
@@ -1855,7 +2192,18 @@ Each item maps to a test in §11.1.
 
 `test_auth.py`: usernames like `admin'--`, `x; DROP TABLE users`, `a b`, `ab`, `"abc\n"` are rejected; lockout after 5 failures; timing path for unknown and malformed usernames calls verify exactly once; last superadmin cannot be deleted; `role_for()` returns `None` right after a revoke and `VIEWER` right after an admin is downgraded; changing your own password needs the current one, and wrong ones count toward the lockout; a superadmin reset clears the lockout; unknown user ids raise `UserNotFound`; malformed database names (incl. `"abc\n"`) are rejected by `grant`, `revoke` and `role_for`; a canary password and a canary typed username never appear in the raw bytes of `app.db` or its WAL file.
 
-`test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute.
+`test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute. It also covers `apply_changes`: several statements commit together; a failure in the last one rolls back the first; a viewer is refused; `confirmed=False` is refused; a statement that is not INSERT/UPDATE/DELETE, or an UPDATE/DELETE without WHERE, rejects the whole batch before anything runs; an UPDATE that matches 0 rows raises `RowConflict` with the right index and leaves the database unchanged; a batch with a DELETE takes a snapshot first and one without does not; one audit entry is written and it contains no parameter values.
+
+Visual builder tests (no model, no browser):
+
+- `test_query_builder.py` (M22): injection-style values (`'; DROP TABLE t; --`, `" OR 1=1`, `%`, `_`) appear only in the parameter list, never in the SQL text; unknown table, column, operator or aggregate is rejected before any SQL exists (`InvalidIdentifier` / `ValueError`); a join that is not an introspected foreign key is rejected, in both directions a real one is accepted, and a fifth join is rejected; `%`, `_` and `\` typed into contains / starts with / ends with match themselves on a fixture table; `join_notes` returns a line only for the row-repeating direction; for each operator, grouping, sorting and limit, the builder's result equals a hand-written SQL query on a fixture database; every compiled query is accepted by `validate(sql, Role.VIEWER, ...)` (so a viewer spec never compiles to a write) and runs on a viewer connection; names with spaces, uppercase, keywords and double quotes work; the SQL and its placeholders survive the guard's re-render unchanged.
+- `test_data_editor.py` (M23): updates, inserts and deletes are keyed on the primary key and fully parameterized; original values are in the WHERE clause and NULL originals match (`IS ?`); a row changed by a second connection after loading gives `RowConflict` and nothing is applied; a table without a primary key yields no statements and the read-only reason; a viewer cannot apply; a delete triggers a snapshot; values with quotes and semicolons round-trip as data; `describe_changes` has one line per change.
+- `test_table_designer.py` (M23): each operation compiles to the expected statement and runs through the Executor on an admin connection; typed names are normalized with `to_snake_identifier` and bad ones (`x"; DROP`, a keyword, `_app_x`, `sqlite_x`, an existing name in another letter case) are refused; a default containing a single quote is escaped; drop and rename need the typed database name and take a backup, and are refused without it; a viewer is refused; `check_designer_op` reports dropping a primary-key or foreign-key column; the add-column limits (no PRIMARY KEY/UNIQUE, NOT NULL needs a default) are refused before SQL exists.
+
+Local web UI tests (M6; they use NiceGUI's own server-side test helper, no browser):
+
+- `tests/security/test_ui_escaping.py`: (1) a table with a value, a column name and a table name equal to `<img src=x onerror=alert(1)>` is opened; the string reaches a grid cell, a label and a notification as plain text (the element's text content is the raw string, the grid has no HTML columns, the notification has no `html` option). (2) A source scan, like `test_no_code_execution.py`, fails if any file under `src/coalescedb/ui/` other than `theme.py` contains `ui.html`, `ui.markdown`, `ui.code`, `html_columns`, `html=True`, `cellRenderer`, `v-html`, `add_head_html`, `add_body_html`, `run_javascript`, or a grid option key starting with `:`. **To reconsider before the first release:** a real-browser check (for example Selenium) that the string is rendered as text; it is left out for now because it needs a new dev dependency.
+- `tests/security/test_local_server.py`: with neither `COALESCEDB_BIND_HOST` nor `COALESCEDB_PORT` set, `bind_host()` and `run_kwargs(...)["host"]` are `127.0.0.1`; with `COALESCEDB_BIND_HOST=0.0.0.0` the status bar carries the "Listening on 0.0.0.0. Other computers can reach this app." warning, and with the default it does not; `run_kwargs` has `host == "127.0.0.1"`, `reload is False`, `show_welcome_message is False`, `fastapi_docs is False`, no `on_air`, and `same_site == "strict"`; a request with `Host: evil.example` is refused; a WebSocket handshake or POST with a foreign `Origin` is refused and one with the app's own origin is accepted; a body larger than `max_upload_mb` is refused with 413 before it is parsed; the UI secret file is created once with owner-only permissions, is reused on the next start and is not inside the repo; a session whose `boot_id` is from another run is treated as signed out; a page for which the user has no role renders nothing and redirects.
 
 `test_registry_paths.py`: `../x`, `x/../../y`, `CON`, `x.db`, uppercase, unicode lookalikes, `"abc\n"` all rejected, as are the lowercase Windows reserved names (`con`, `prn`, `aux`, `nul`, `com1`, `lpt1`); a symlink inside `databases_dir` pointing outside is refused. `test_db_names.py` covers `validate_db_name` directly.
 
@@ -1891,7 +2239,7 @@ python evals/run_evals.py --suite extraction  --model qwen2.5-coder:1.5b-instruc
 - Writes `evals/results.md` with date, model, hardware and numbers. **README badges and resume bullets must only cite numbers from this file.** Comparing `1.5b` vs `7b` in the same table is a good trade-off story.
 - **Version 2 additions:**
   - Run every suite for each model in the ladder (1.5B and 0.5B), and for stock vs fine-tuned models once §16 exists. These numbers set the feature-gating table in §6.22.
-  - **Explanation faithfulness:** 30+ cases in `evals/explain/cases.jsonl` (facts from real model and forecast results). Metric = share of LLM outputs that pass `is_faithful`, plus a manual 1–5 clarity rating on 10 samples. The app is safe either way (failures fall back to the template), but a low pass rate means "Make it simpler" rarely helps.
+  - **Explanation faithfulness:** 30+ cases in `evals/explain/cases.jsonl` (facts from real model and forecast results). Metric = share of LLM outputs that pass `is_faithful`, plus a manual 1–5 clarity rating on 10 samples. The app is safe either way (failures fall back to the template), but a low pass rate means "Simplify wording" rarely helps.
   - **Benchmark table:** record `gen_tps` and `prompt_tps` per model on every machine you can test (your laptop, a lab PC, an older laptop) so the README can say where AI mode turns on.
 
 ### 11.3 CI — `.github/workflows/ci.yml`
@@ -1902,9 +2250,11 @@ On push/PR: set up Python 3.12 → install `requirements-dev.txt` → `ruff chec
 
 ## 12. Error Handling & UX Rules
 
-- Every `CoalesceDBError` shows `st.error(e.user_message)`; unexpected exceptions show a generic message plus a trace ID that matches a line in `traces.jsonl`.
-- LLM down ≠ app down: SQL mode, browsing and spreadsheet import keep working.
-- Long operations (model pull, PDF extraction) use `st.status` with per-step progress and a cancel button that stops before the next chunk.
+- Errors follow DESIGN.md §5: the actual error, plus what the user can do. Never a generic "Something went wrong."
+- Every `CoalesceDBError` is shown with its `user_message`: next to the control that caused it when there is one (inline, in the negative colour with the text), otherwise as `ui.notify(e.user_message, type="negative")`. Text that comes from SQLite or the guard (`ExecutionError.sqlite_message`, `SQLRejected.reasons`) is shown in monospace, as plain text (§8 display rule), followed by the next step (for example "Check the column name in the schema tree.").
+- Unexpected exceptions show "Unexpected error (<ExceptionClass>). Trace ID <id>. Details are in traces.jsonl." The exception's own message is never shown, because it can contain data; the trace ID matches a line in `traces.jsonl`, which records the class and where it happened, not values (§6.17). NiceGUI's default error page, which prints the exception message, is replaced through `@app.on_page_exception`, `ui.on_exception` and `app.on_exception` (§8.6).
+- LLM down ≠ app down: the query builder, typed SQL, browsing, the data editor and spreadsheet import keep working.
+- Long operations (model pull, PDF extraction) show per-step progress in place (a `ui.linear_progress` with the step named in text, updated by a `ui.timer` that reads shared progress state; the worker thread never touches the UI, §6.22) and a **Cancel** button that stops before the next chunk. No full-screen overlay.
 - Nothing is written to a database until the user clicks a confirm button on a screen that shows exactly what will be written.
 
 ---
@@ -1939,25 +2289,29 @@ In this order, so the first screen answers "what is it and does it work":
 | M2 | `AppStore`, `passwords.py`, `AuthService` (§6.1) | `test_auth.py` passes |
 | M3 | `DatabaseRegistry` (§6.3), `connection.py` + authorizer (§6.4), `introspect.py` (§6.5), `BackupService.snapshot` (§6.7) | `test_registry_paths.py`, `test_authorizer.py` pass, incl. admin DDL succeeding; delete() creates a backup first; a failing snapshot leaves the DB and its grants untouched; pruning keeps `backups_to_keep` |
 | M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes |
-| M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many` and `apply_schema`; destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute |
-| M6 | Streamlit UI (§8.1–8.3, §8.5, §8.6): login, first-run setup, sidebar, Write-SQL mode, admin page | Manual: two users, viewer blocked from writes in UI *and* by direct executor call |
-| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Ask-in-English mode, behind-the-scenes panel | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction |
-| M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized |
-| M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document |
+| M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many`, `apply_schema` and `apply_changes` (incl. `RowConflict` rollback); destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute |
+| M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. DESIGN.md followed; DESIGN.md §8 checklist (all 7 items) reported |
+| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
 | M10 | Evals harness + first `results.md` (§11.2) | Numbers recorded for 1.5b (and 7b if hardware allows) |
 | M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3) | Built app starts on a clean machine, downloads the model on first run after consent, works offline after |
 | M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 |
-| M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel |
-| M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact |
-| M15 | Benchmark & model ladder (§6.22), AI status in sidebar, feature gating | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking |
-| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart |
-| M17 | Profiling, correlation, modeling (§6.24), Summary/Relationships/Model tabs | `test_analytics.py` and `test_no_code_execution.py` pass; a 200k-row regression finishes or times out cleanly without freezing the UI |
-| M18 | Forecasting (§6.25), Forecast tab | `test_forecasting.py` passes; intervals shown; naive-baseline comparison visible |
-| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md` |
+| M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M17 | Profiling, correlation, modeling (§6.24), Summary/Relationships/Model tabs | `test_analytics.py` and `test_no_code_execution.py` pass; a 200k-row regression finishes or times out cleanly without freezing the UI. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M18 | Forecasting (§6.25), Forecast tab | `test_forecasting.py` passes; intervals shown; naive-baseline comparison visible. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md`. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
 | M20 | Fine-tuning track (§16), separate from app code; can start once M10 evals exist | Fine-tuned model beats stock by the margin in §16.6, or the stock model stays default and the result is documented anyway |
 | M21 | *(Optional)* Live database import (§6.20) | Imports from a local PostgreSQL in Docker; a password canary never appears on disk; source DB unchanged (row counts match and a write attempt fails) |
+| M22 | Query builder (§6.27), Build query mode as the Query page default, Show SQL panel (§8.3). **Built right after M6** | `test_query_builder.py` passes; with AI off, a viewer answers a filtered, grouped question across two linked tables without typing SQL; the sqlglot round-trip check in §6.27 holds. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M23 | Data editor (§6.28, §8.8) and table designer (§6.29, §8.9). **Built after M9** (needs `compile_ddl`) | `test_data_editor.py` and `test_table_designer.py` pass; with AI off, an admin creates a table, adds a column, edits and deletes rows and drops the table by clicking only; a viewer sees the grid read-only; a conflicting edit is reported, not overwritten; the sqlglot checks in §6.28 and §6.29 hold. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
 
-**Recommended order:** if you haven't reached M11 yet, build M1–M10, then M13–M19 (and M21 if wanted), then M11–M12, so the executable is packaged and tested once with every feature. M20 runs in parallel whenever you have GPU time; its model is swapped in through `model_ladder` with no app code changes.
+**DESIGN.md checklist.** Every milestone with UI work (M6, M7, M8, M9, M13–M19, M22, M23) is done only when the seven checks in DESIGN.md §8 have been run and their results reported: nothing from its banned list; correct in light, dark and reduced-transparency mode; no `backdrop-blur` on repeated or scrolling elements; bundled fonts in use; primary data visible at 1280x800 without scrolling; every number from real app state; all new strings follow its microcopy rules.
+
+**Recommended order:** milestone numbers are stable, not sequential: M22 is built right after M6, and M23 after M9. If you haven't reached M11 yet, build M1–M6, M22, M7–M9, M23, M10, then M13–M19 (and M21 if wanted), then M11–M12, so the executable is packaged and tested once with every feature. M20 runs in parallel whenever you have GPU time; its model is swapped in through `model_ladder` with no app code changes.
 
 ---
 
