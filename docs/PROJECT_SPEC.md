@@ -4,7 +4,7 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 
 **Version 2 additions:** import from other SQL databases (dump files and, optionally, live connections) translated to SQLite; export results to CSV/XLSX; Excel-style charts saved as PNG/SVG/PDF; one-click analytics (summaries, correlation, regression, clustering, forecasting) built on pandas, NumPy, scikit-learn and statsmodels; plain-English business explanations of the results; a startup speed benchmark that picks the model size the machine can handle; and an optional fine-tuned, quantized model (§16).
 
-**Visual builder:** a non-technical user, with AI off, can query, edit and design tables by clicking (§6.27–§6.29). Typed SQL stays available as an advanced option. The UI is built with NiceGUI and follows `DESIGN.md` for look, layout and wording.
+**Visual builder:** a non-technical user, with AI off, can query, edit and design tables by clicking (§6.27–§6.29). Typed SQL stays available as an advanced option. The UI is built with NiceGUI and follows `docs/DESIGN.md` for look, layout and wording.
 
 > **How to use this spec with a coding agent:** Build in the milestone order in §15. Give the agent one milestone at a time and require the acceptance tests for that milestone to pass before moving on. Section numbers are stable; refer to them in prompts ("implement §6.2 exactly").
 
@@ -70,7 +70,11 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 ```
 coalescedb/
 ├── launcher.py                   # Entry point, packaged and from source: sidecar, server, window (§9)
-├── DESIGN.md                     # Look, layout and wording of the UI (§8)
+├── CLAUDE.md                     # Rules for the coding agent; stays at the repo root
+├── docs/
+│   ├── PROJECT_SPEC.md           # This file: behaviour and security (source of truth)
+│   ├── DESIGN.md                 # Look, layout and wording of the UI (§8)
+│   └── DECISIONS.md              # Decision log, appended at the end of each milestone; the spec wins
 ├── pyproject.toml
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -139,7 +143,7 @@ coalescedb/
 │           ├── __init__.py
 │           ├── main.py           # run(): services, page registration, ui.run (§8.1, §8.6)
 │           ├── server.py         # Local-server controls: host/origin checks, upload cap, UI secret (§8.6)
-│           ├── theme.py          # The ONE place for style constants, colours and fonts (DESIGN.md §6)
+│           ├── theme.py          # The ONE place for style constants, colours and fonts (docs/DESIGN.md §6)
 │           ├── session.py        # Typed wrapper around app.storage.user; re-loads User and role (§8.1)
 │           ├── shell.py          # Sidebar, toolbar, status bar, inspector frame (§8.2)
 │           ├── login.py          # Login + first-run admin setup page
@@ -570,6 +574,8 @@ After the permission check (so a non-superadmin learns nothing), `delete_user`, 
 `grant`, `revoke`, `revoke_all`, `rename_grants` and `role_for` validate every database name with `validate_db_name()` (defined in `db/identifiers.py`, §6.8: `DB_NAME_RE.fullmatch()` plus the Windows reserved names) and raise `InvalidIdentifier` for a bad name. The name is also only ever passed as a bound parameter.
 
 `grant` does not check that the database exists (AuthService cannot see the files), so a grant row can exist for a name before any database does. The registry clears such stray rows with `revoke_all` whenever a name comes into use (§6.3).
+
+**Known accepted limitation:** after `login_max_failures` attempts, a locked account answers `AccountLockedError` while an unknown name answers `AuthError`, so repeated guesses reveal that a username exists. Accepted for a local, single-machine app.
 
 **UI preferences (added at M6).** Dark mode is stored per user in `app.db`, in its own table so the M2 `users` table is unchanged:
 
@@ -1836,20 +1842,20 @@ Columns (name: type): {columns_with_types}
 
 ## 8. User Interface — `ui/`
 
-**All UI work follows `DESIGN.md`: look, layout and wording.** This spec decides behaviour and security. If the two conflict with each other, or with what the installed NiceGUI supports, stop and ask (CLAUDE.md). The UI library is NiceGUI (§1).
+**All UI work follows `docs/DESIGN.md`: look, layout and wording.** This spec decides behaviour and security. If the two conflict with each other, or with what the installed NiceGUI supports, stop and ask (CLAUDE.md). The UI library is NiceGUI (§1).
 
-**Display rule (security).** Anything that came from a database, a file, a user or the model (cell values, table and column names, file names, usernames, SQLite error text, generated or compiled SQL, model explanations) is shown only through components that escape text: `ui.label`, input values, tooltips, `ui.notify`, and `ui.table` / `ui.aggrid` cells in their default text mode. It is never passed to `ui.html`, `ui.markdown`, `ui.code` (which renders through Markdown), `ui.aggrid(html_columns=...)`, an AG Grid cell renderer, an AG Grid option key starting with `:` (NiceGUI evaluates those as JavaScript), `ui.notify(..., html=True)`, `ui.add_head_html` / `ui.add_body_html`, `ui.run_javascript`, or a table slot that uses `v-html`. To keep this checkable, `ui/` does not use those features at all, for any content. The single exception is `ui/theme.py`, which adds the two global items DESIGN.md §6 allows (the font-face declarations and the colour registration) from constant strings. Charts keep the escaping in §6.23. `test_ui_escaping.py` enforces both halves (§11.1).
+**Display rule (security).** Anything that came from a database, a file, a user or the model (cell values, table and column names, file names, usernames, SQLite error text, generated or compiled SQL, model explanations) is shown only through components that escape text: `ui.label`, input values, tooltips, `ui.notify`, and `ui.table` / `ui.aggrid` cells in their default text mode. It is never passed to `ui.html`, `ui.markdown`, `ui.code` (which renders through Markdown), `ui.aggrid(html_columns=...)`, an AG Grid cell renderer, an AG Grid option key starting with `:` (NiceGUI evaluates those as JavaScript), `ui.notify(..., html=True)`, `ui.add_head_html` / `ui.add_body_html`, `ui.run_javascript`, or a table slot that uses `v-html`. To keep this checkable, `ui/` does not use those features at all, for any content. The single exception is `ui/theme.py`, which adds the two global items docs/DESIGN.md §6 allows (the font-face declarations and the colour registration) from constant strings. Charts keep the escaping in §6.23. `test_ui_escaping.py` enforces both halves (§11.1).
 
 **No SQL in the UI (§0.10).** UI code calls `compile_query`, `compile_changes` or `compile_designer_op` (§6.27–§6.29), or passes on SQL the user typed in Write SQL mode or SQL the model proposed in Generate SQL mode (§0.10). It never builds or edits SQL text itself.
 
 **Blocking work.** Every call that can take time (Executor, LLM, file reading, export) is awaited through `run.io_bound` so the event loop, which serves every open page, is never blocked. `run.cpu_bound` is not used (it passes work to another process with pickle); analytics keep the worker process of §6.24.
 
-**Decisions taken where DESIGN.md and NiceGUI meet** (checked against NiceGUI 3.17.1):
+**Decisions taken where docs/DESIGN.md and NiceGUI meet** (checked against NiceGUI 3.17.1):
 
-- Tailwind `dark:` variants follow `ui.dark_mode()`: NiceGUI's page template ties the `dark` variant to Quasar's `body--dark` class. DESIGN.md §3's check passes.
-- `ui.colors` holds one value per role, but DESIGN.md §3 gives a light and a dark value. `ui/theme.py` registers the light set or the dark set to match the current mode, and calls `ui.colors` again whenever dark mode changes. No stylesheet is used for this.
-- NiceGUI's default font is Roboto. `ui/theme.py` sets the bundled Geist font on `body` and JetBrains Mono through a theme constant (DESIGN.md §4).
-- AG Grid takes its fonts and colours from its own theme. If matching DESIGN.md turns out to need a stylesheet rather than AG Grid's theme options and cell classes, STOP and ask at M6.
+- Tailwind `dark:` variants follow `ui.dark_mode()`: NiceGUI's page template ties the `dark` variant to Quasar's `body--dark` class. docs/DESIGN.md §3's check passes.
+- `ui.colors` holds one value per role, but docs/DESIGN.md §3 gives a light and a dark value. `ui/theme.py` registers the light set or the dark set to match the current mode, and calls `ui.colors` again whenever dark mode changes. No stylesheet is used for this.
+- NiceGUI's default font is Roboto. `ui/theme.py` sets the bundled Geist font on `body` and JetBrains Mono through a theme constant (docs/DESIGN.md §4).
+- AG Grid takes its fonts and colours from its own theme. If matching docs/DESIGN.md turns out to need a stylesheet rather than AG Grid's theme options and cell classes, STOP and ask at M6.
 
 ### 8.1 Page Routing — `ui/main.py`
 
@@ -1859,7 +1865,7 @@ def run(*, native: bool, port: int) -> None:           # Called by launcher.py (
     services = build_services(settings)    # Created ONCE per process: AppStore, AuthService,
                                            # Registry, Executor, LLM client, shared AIStatus
     server.install(settings)               # Host and Origin checks, upload cap, error handlers (§8.6)
-    theme.install(settings)                # Fonts as local static files, colours (DESIGN.md)
+    theme.install(settings)                # Fonts as local static files, colours (docs/DESIGN.md)
     register_pages(services)
     ui.run(**server.run_kwargs(settings, native=native, port=port))    # §8.6
 
@@ -1882,7 +1888,7 @@ The same re-load runs at the start of **every event handler that does something*
 
 ### 8.2 Shell — `ui/shell.py`
 
-One shell for every signed-in page, laid out as in DESIGN.md §5. (The login and first-run pages have no shell: one small panel on the window base, with the app name as its title and no tagline.)
+One shell for every signed-in page, laid out as in docs/DESIGN.md §5. (The login and first-run pages have no shell: one small panel on the window base, with the app name as its title and no tagline.)
 
 **Sidebar (left, collapsible)**
 - Navigation, compact rows at the top: Query · Data · Analyze · Import (admin only) · Admin (superadmin only). Only pages the user may open are listed; each page still re-checks (§8.1).
@@ -1904,7 +1910,7 @@ One shell for every signed-in page, laid out as in DESIGN.md §5. (The login and
 
 **Preferences**
 - **Dark mode:** per user, stored in `app.db` (`user_prefs`, §6.1). Values `auto` (follow the system), `light`, `dark`. Applied with `ui.dark_mode()` on every page load; the toolbar toggle calls `set_dark_mode`. The login page uses `auto`.
-- **Reduced transparency:** per install, because it depends on the computer, not the person. Stored as one boolean in NiceGUI's general storage (`app.storage.general`, a file in `settings.ui_storage_dir`). Any signed-in user can switch it from the user menu. When on, `ui/theme.py` hands out the solid versions of the panel styles (DESIGN.md §2); no blur class is used anywhere.
+- **Reduced transparency:** per install, because it depends on the computer, not the person. Stored as one boolean in NiceGUI's general storage (`app.storage.general`, a file in `settings.ui_storage_dir`). Any signed-in user can switch it from the user menu. When on, `ui/theme.py` hands out the solid versions of the panel styles (docs/DESIGN.md §2); no blur class is used anywhere.
 
 ### 8.3 Query Page
 
@@ -2006,7 +2012,7 @@ Admins only (§6.29). Entry points: **New table** at the top of the schema tree,
 
 - **New table:** a dialog with the table name and a small grid of columns (name, type from the fixed `ColumnType` list, required, default, allowed values), the primary key choice (default: an automatic `id`), and optional links to other tables, picked from lists of existing tables and columns. Names are shown as they will be stored (the `to_snake_identifier` result) while typing.
 - **Add column / Rename:** a small dialog with the same fields for one column, or one name field.
-- Before running, each dialog states the effect in plain words and, for drops and renames, uses the §6.29 wording with the typed database name. Destructive buttons are never the primary colour (DESIGN.md §3).
+- Before running, each dialog states the effect in plain words and, for drops and renames, uses the §6.29 wording with the typed database name. Destructive buttons are never the primary colour (docs/DESIGN.md §3).
 - Problems found by `check_designer_op` are listed in the dialog and disable the confirm button; an error from SQLite is shown in monospace with what to do next (§12).
 - After a change the schema tree and any open grid reload from introspection.
 
@@ -2250,7 +2256,7 @@ On push/PR: set up Python 3.12 → install `requirements-dev.txt` → `ruff chec
 
 ## 12. Error Handling & UX Rules
 
-- Errors follow DESIGN.md §5: the actual error, plus what the user can do. Never a generic "Something went wrong."
+- Errors follow docs/DESIGN.md §5: the actual error, plus what the user can do. Never a generic "Something went wrong."
 - Every `CoalesceDBError` is shown with its `user_message`: next to the control that caused it when there is one (inline, in the negative colour with the text), otherwise as `ui.notify(e.user_message, type="negative")`. Text that comes from SQLite or the guard (`ExecutionError.sqlite_message`, `SQLRejected.reasons`) is shown in monospace, as plain text (§8 display rule), followed by the next step (for example "Check the column name in the schema tree.").
 - Unexpected exceptions show "Unexpected error (<ExceptionClass>). Trace ID <id>. Details are in traces.jsonl." The exception's own message is never shown, because it can contain data; the trace ID matches a line in `traces.jsonl`, which records the class and where it happened, not values (§6.17). NiceGUI's default error page, which prints the exception message, is replaced through `@app.on_page_exception`, `ui.on_exception` and `app.on_exception` (§8.6).
 - LLM down ≠ app down: the query builder, typed SQL, browsing, the data editor and spreadsheet import keep working.
@@ -2288,28 +2294,28 @@ In this order, so the first screen answers "what is it and does it work":
 | M1 | Project skeleton (§1, §2), `config.py` (§3), `errors.py` (§4), `models.py` (§5), `identifiers.py` (§6.8) | `pytest tests/security/test_identifiers.py` passes, incl. both quoting functions |
 | M2 | `AppStore`, `passwords.py`, `AuthService` (§6.1) | `test_auth.py` passes |
 | M3 | `DatabaseRegistry` (§6.3), `connection.py` + authorizer (§6.4), `introspect.py` (§6.5), `BackupService.snapshot` (§6.7) | `test_registry_paths.py`, `test_authorizer.py` pass, incl. admin DDL succeeding; delete() creates a backup first; a failing snapshot leaves the DB and its grants untouched; pruning keeps `backups_to_keep` |
-| M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes |
+| M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. |
 | M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17) | `test_executor.py` passes for `execute`, `execute_many`, `apply_schema` and `apply_changes` (incl. `RowConflict` rollback); destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute |
-| M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. DESIGN.md followed; DESIGN.md §8 checklist (all 7 items) reported |
-| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following docs/DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. docs/DESIGN.md followed; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. |
 | M10 | Evals harness + first `results.md` (§11.2) | Numbers recorded for 1.5b (and 7b if hardware allows) |
-| M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3) | Built app starts on a clean machine, downloads the model on first run after consent, works offline after |
+| M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3). Before building, generate a full lock file pinning every package, transitive dependencies included. | Built app starts on a clean machine, downloads the model on first run after consent, works offline after |
 | M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 |
-| M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M17 | Profiling, correlation, modeling (§6.24), Summary/Relationships/Model tabs | `test_analytics.py` and `test_no_code_execution.py` pass; a 200k-row regression finishes or times out cleanly without freezing the UI. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M18 | Forecasting (§6.25), Forecast tab | `test_forecasting.py` passes; intervals shown; naive-baseline comparison visible. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md`. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M17 | Profiling, correlation, modeling (§6.24), Summary/Relationships/Model tabs | `test_analytics.py` and `test_no_code_execution.py` pass; a 200k-row regression finishes or times out cleanly without freezing the UI. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M18 | Forecasting (§6.25), Forecast tab | `test_forecasting.py` passes; intervals shown; naive-baseline comparison visible. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md`. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
 | M20 | Fine-tuning track (§16), separate from app code; can start once M10 evals exist | Fine-tuned model beats stock by the margin in §16.6, or the stock model stays default and the result is documented anyway |
 | M21 | *(Optional)* Live database import (§6.20) | Imports from a local PostgreSQL in Docker; a password canary never appears on disk; source DB unchanged (row counts match and a write attempt fails) |
-| M22 | Query builder (§6.27), Build query mode as the Query page default, Show SQL panel (§8.3). **Built right after M6** | `test_query_builder.py` passes; with AI off, a viewer answers a filtered, grouped question across two linked tables without typing SQL; the sqlglot round-trip check in §6.27 holds. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
-| M23 | Data editor (§6.28, §8.8) and table designer (§6.29, §8.9). **Built after M9** (needs `compile_ddl`) | `test_data_editor.py` and `test_table_designer.py` pass; with AI off, an admin creates a table, adds a column, edits and deletes rows and drops the table by clicking only; a viewer sees the grid read-only; a conflicting edit is reported, not overwritten; the sqlglot checks in §6.28 and §6.29 hold. UI work follows DESIGN.md; DESIGN.md §8 checklist (all 7 items) reported |
+| M22 | Query builder (§6.27), Build query mode as the Query page default, Show SQL panel (§8.3). **Built right after M6** | `test_query_builder.py` passes; with AI off, a viewer answers a filtered, grouped question across two linked tables without typing SQL; the sqlglot round-trip check in §6.27 holds. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M23 | Data editor (§6.28, §8.8) and table designer (§6.29, §8.9). **Built after M9** (needs `compile_ddl`) | `test_data_editor.py` and `test_table_designer.py` pass; with AI off, an admin creates a table, adds a column, edits and deletes rows and drops the table by clicking only; a viewer sees the grid read-only; a conflicting edit is reported, not overwritten; the sqlglot checks in §6.28 and §6.29 hold. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
 
-**DESIGN.md checklist.** Every milestone with UI work (M6, M7, M8, M9, M13–M19, M22, M23) is done only when the seven checks in DESIGN.md §8 have been run and their results reported: nothing from its banned list; correct in light, dark and reduced-transparency mode; no `backdrop-blur` on repeated or scrolling elements; bundled fonts in use; primary data visible at 1280x800 without scrolling; every number from real app state; all new strings follow its microcopy rules.
+**docs/DESIGN.md checklist.** Every milestone with UI work (M6, M7, M8, M9, M13–M19, M22, M23) is done only when the seven checks in docs/DESIGN.md §8 have been run and their results reported: nothing from its banned list; correct in light, dark and reduced-transparency mode; no `backdrop-blur` on repeated or scrolling elements; bundled fonts in use; primary data visible at 1280x800 without scrolling; every number from real app state; all new strings follow its microcopy rules.
 
 **Recommended order:** milestone numbers are stable, not sequential: M22 is built right after M6, and M23 after M9. If you haven't reached M11 yet, build M1–M6, M22, M7–M9, M23, M10, then M13–M19 (and M21 if wanted), then M11–M12, so the executable is packaged and tested once with every feature. M20 runs in parallel whenever you have GPU time; its model is swapped in through `model_ladder` with no app code changes.
 

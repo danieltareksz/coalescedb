@@ -2,7 +2,7 @@
 
 UI rules for CoalesceDB. Read this file before writing or changing any NiceGUI
 layout, component, color, font, or piece of interface text. These rules sit
-alongside CLAUDE.md and PROJECT_SPEC.md. If a rule here conflicts with the
+alongside CLAUDE.md and docs/PROJECT_SPEC.md. If a rule here conflicts with the
 spec or with the installed NiceGUI/Quasar version, STOP and tell me. Do not
 improvise a workaround.
 
