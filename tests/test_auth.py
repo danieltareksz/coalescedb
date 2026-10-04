@@ -838,3 +838,108 @@ def test_passwords_and_typed_unknown_usernames_never_reach_the_disk(auth, settin
     for label, canary in canaries.items():
         assert canary.encode("utf-8") not in data, label
         assert canary.encode("utf-16-le") not in data, label
+
+
+# --- M3 additions: require_superadmin, revoke_all, rename_grants -----------------------
+
+
+def grant_rows(settings):
+    return db_rows(settings, "SELECT user_id, db_name, role FROM grants ORDER BY db_name, user_id")
+
+
+def test_require_superadmin(auth, superadmin, alice):
+    assert auth.require_superadmin(superadmin) is None
+    for actor in (
+        alice,
+        User(id=alice.id, username=alice.username, is_superadmin=True),
+        User(id=UNKNOWN_ID, username="ghost", is_superadmin=True),
+        None,
+    ):
+        with pytest.raises(PermissionDenied):
+            auth.require_superadmin(actor)
+
+
+def test_revoke_all_removes_every_users_grant_on_one_database(
+    auth, superadmin, alice, bob, settings
+):
+    auth.grant(superadmin, alice.id, "sales", Role.VIEWER)
+    auth.grant(superadmin, bob.id, "sales", Role.ADMIN)
+    auth.grant(superadmin, superadmin.id, "sales", Role.ADMIN)
+    auth.grant(superadmin, alice.id, "hr", Role.VIEWER)
+
+    auth.revoke_all(superadmin, "sales")
+
+    assert grant_rows(settings) == [(alice.id, "hr", "viewer")]
+    assert auth.role_for(alice, "sales") is None
+    assert auth.role_for(bob, "sales") is None
+    entries = [e for e in auth.read_audit(superadmin) if e["action"] == "revoke_all"]
+    assert len(entries) == 1
+    assert entries[0]["db_name"] == "sales"
+    assert entries[0]["user_id"] == superadmin.id
+
+
+def test_revoke_all_with_no_grants_is_harmless(auth, superadmin, alice, settings):
+    auth.grant(superadmin, alice.id, "hr", Role.VIEWER)
+    auth.revoke_all(superadmin, "sales")
+    assert grant_rows(settings) == [(alice.id, "hr", "viewer")]
+
+
+def test_rename_grants_moves_every_users_grant(auth, superadmin, alice, bob, settings):
+    auth.grant(superadmin, alice.id, "sales", Role.VIEWER)
+    auth.grant(superadmin, bob.id, "sales", Role.ADMIN)
+    auth.grant(superadmin, alice.id, "hr", Role.VIEWER)
+
+    auth.rename_grants(superadmin, "sales", "crm")
+
+    assert grant_rows(settings) == [
+        (alice.id, "crm", "viewer"),
+        (bob.id, "crm", "admin"),
+        (alice.id, "hr", "viewer"),
+    ]
+    assert auth.role_for(alice, "sales") is None
+    assert auth.role_for(alice, "crm") is Role.VIEWER
+    assert auth.role_for(bob, "crm") is Role.ADMIN
+    entries = [e for e in auth.read_audit(superadmin) if e["action"] == "rename_grants"]
+    assert len(entries) == 1
+    assert entries[0]["user_id"] == superadmin.id
+
+
+@pytest.mark.parametrize("kind", ACTOR_KINDS)
+def test_revoke_all_and_rename_grants_are_superadmin_only(
+    auth, superadmin, alice, bob, settings, kind
+):
+    auth.grant(superadmin, bob.id, "sales", Role.VIEWER)
+    actor = make_actor(kind, auth, superadmin, alice)
+    before = grant_rows(settings)
+    with pytest.raises(PermissionDenied):
+        auth.revoke_all(actor, "sales")
+    with pytest.raises(PermissionDenied):
+        auth.rename_grants(actor, "sales", "crm")
+    assert grant_rows(settings) == before
+
+
+@pytest.mark.parametrize("db_name", BAD_DB_NAMES + [None, "con", "nul", "com1", "lpt9", "CON"])
+def test_revoke_all_and_rename_grants_reject_bad_names(
+    auth, superadmin, alice, settings, db_name
+):
+    auth.grant(superadmin, alice.id, "sales", Role.VIEWER)
+    with pytest.raises(InvalidIdentifier):
+        auth.revoke_all(superadmin, db_name)
+    with pytest.raises(InvalidIdentifier):
+        auth.rename_grants(superadmin, db_name, "crm")
+    with pytest.raises(InvalidIdentifier):
+        auth.rename_grants(superadmin, "sales", db_name)
+    assert grant_rows(settings) == [(alice.id, "sales", "viewer")]
+
+
+@pytest.mark.parametrize("db_name", ["con", "prn", "aux", "nul", "com1", "lpt1", "CON"])
+def test_grant_revoke_and_role_for_reject_windows_reserved_names(
+    auth, superadmin, alice, settings, db_name
+):
+    with pytest.raises(InvalidIdentifier):
+        auth.grant(superadmin, alice.id, db_name, Role.VIEWER)
+    with pytest.raises(InvalidIdentifier):
+        auth.revoke(superadmin, alice.id, db_name)
+    with pytest.raises(InvalidIdentifier):
+        auth.role_for(alice, db_name)
+    assert grant_rows(settings) == []

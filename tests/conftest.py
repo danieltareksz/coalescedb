@@ -69,3 +69,17 @@ def auth(store, settings, fast_hashing):
 @pytest.fixture
 def superadmin(auth):
     return auth.bootstrap_superadmin("root_admin", SUPER_PASSWORD)
+
+
+@pytest.fixture
+def backups(settings):
+    from coalescedb.db.backup import BackupService
+
+    return BackupService(settings)
+
+
+@pytest.fixture
+def registry(settings, auth, backups):
+    from coalescedb.db.registry import DatabaseRegistry
+
+    return DatabaseRegistry(settings, auth, backups)

@@ -143,6 +143,7 @@ coalescedb/
 │   │   ├── test_sql_guard.py     # Red-team corpus (§11.1)
 │   │   ├── test_authorizer.py
 │   │   ├── test_identifiers.py
+│   │   ├── test_db_names.py      # validate_db_name, Windows reserved names (§6.8)
 │   │   └── test_registry_paths.py
 │   ├── test_auth.py
 │   ├── test_config.py
@@ -648,6 +649,7 @@ Requirements:
 - **All connections to user databases:** `PRAGMA trusted_schema = OFF`, run with the other PRAGMAs before the authorizer is installed. This is SQLite's own advice for database files the app didn't create (imports, §6.3).
 - **Admin:** normal read-write connection, `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`. These PRAGMAs are run **before** the authorizer is installed, because the authorizer then denies all PRAGMAs.
 - **Both:** `conn.enable_load_extension(False)` where available.
+- **Autocommit:** connections are opened in autocommit mode (`isolation_level=None`); callers that need a transaction issue `BEGIN`/`COMMIT` themselves, which the Executor (M5) relies on.
 - **Authorizer** via `conn.set_authorizer(callback)`:
   - Viewer allowlist: `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION` (only if function name not in `FORBIDDEN_FUNCTIONS`), `SQLITE_RECURSIVE`. Everything else → `SQLITE_DENY`.
   - Admin: deny `SQLITE_ATTACH`, `SQLITE_DETACH`, `SQLITE_PRAGMA`, `SQLITE_CREATE_TRIGGER`, all `SQLITE_CREATE_TEMP_*` codes, `SQLITE_CREATE_VTABLE`, `SQLITE_DROP_VTABLE`, forbidden functions, and any write to `_app_*` tables. Allow the rest.
@@ -656,7 +658,7 @@ Requirements:
   - **Known limit — rename targets:** for `ALTER TABLE t RENAME TO _app_x`, SQLite only ever tells the authorizer the *old* name (`t`); the new name is never passed to it (checked on SQLite 3.53.1). The authorizer therefore cannot refuse a rename by its target. That statement is covered by the guard instead: step 7 of §6.2 (built in M4) rejects any reference to an `_app_` name, and `test_sql_guard.py` has a row for `ALTER TABLE t RENAME TO _app_x` (§11.1). The case is not part of `test_authorizer.py` (M3).
   - A statement the authorizer denies raises `sqlite3.DatabaseError` ("not authorized") from the connection. Turning that into the app's `ExecutionError` is the Executor's job (§6.6).
   - **Do not deny writes to `sqlite_*` tables for admins.** SQLite reports every `CREATE`, `DROP` and `ALTER` as a write to `sqlite_master`, so that rule blocks all schema changes. Direct tampering (`UPDATE sqlite_master`, `PRAGMA writable_schema`) is already stopped by guard step 7 and the PRAGMA deny. `test_authorizer.py` must confirm that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` succeed for admins.
-  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
+  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
 - **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`.
 
 ### 6.5 Introspection — `db/introspect.py`
@@ -1832,7 +1834,7 @@ Each item maps to a test in §11.1.
 
 `test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute.
 
-`test_registry_paths.py`: `../x`, `x/../../y`, `CON`, `x.db`, uppercase, unicode lookalikes, `"abc\n"` all rejected, as are the lowercase Windows reserved names (`con`, `prn`, `aux`, `nul`, `com1`, `lpt1`); a symlink inside `databases_dir` pointing outside is refused. `test_identifiers.py` covers `validate_db_name` directly.
+`test_registry_paths.py`: `../x`, `x/../../y`, `CON`, `x.db`, uppercase, unicode lookalikes, `"abc\n"` all rejected, as are the lowercase Windows reserved names (`con`, `prn`, `aux`, `nul`, `com1`, `lpt1`); a symlink inside `databases_dir` pointing outside is refused. `test_db_names.py` covers `validate_db_name` directly.
 
 Other M3 tests: `test_registry.py` (create / delete / rename / import_file: a backup is made before a delete, a failing snapshot leaves the database and its grants untouched, stray grants for a name are cleared when the name comes into use, deleted databases' backups move to `_deleted`, a leftover `backups_dir/<name>/` is moved to `_deleted` by `create` and by `import_file` so the new database starts with no backups, every operation is audited, files with triggers or virtual tables are refused); `test_backup.py` (snapshot is a faithful copy, pruning keeps `backups_to_keep` and never touches another folder); `test_introspect.py` (`list_tables`, `schema_ddl` truncation order, `sample_rows`).
 
