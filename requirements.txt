@@ -1,3 +1,4 @@
-# Runtime packages, exact versions. Only what the code needs so far (through M2).
+# Runtime packages, exact versions. Only what the code needs so far (through M4).
 argon2-cffi==25.1.0
 platformdirs==4.12.2
+sqlglot==30.21.0
