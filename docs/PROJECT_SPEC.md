@@ -38,7 +38,7 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 | Icons | Material Symbols Outlined | Already shipped inside NiceGUI as a local file; no new asset |
 | Databases | SQLite via stdlib `sqlite3` | One `.db` file per database |
 | SQL parsing | `sqlglot` (dialect `sqlite`) | Allowlist validator |
-| LLM runtime | Ollama, model `qwen2.5-coder:1.5b` | Via HTTP; managed sidecar in packaged builds (§9) |
+| LLM runtime | Ollama, model `qwen2.5-coder:1.5b` | Via HTTP; managed sidecar in packaged builds (§9). One ladder per AI task (§3); Qwen3 models are eval candidates, not defaults (§11.2) |
 | LLM client | `httpx` + Ollama native `/api/chat` with `format` = JSON Schema | Structured outputs without an extra framework |
 | Validation | `pydantic` v2 | All LLM JSON is validated |
 | Passwords | `argon2-cffi` | Argon2id hashing |
@@ -65,13 +65,18 @@ A local-first database management GUI. Users manage multiple SQLite databases, a
 
 **Model licensing note:** `qwen2.5-coder:1.5b` and `:7b` are Apache-2.0. The `:3b` variant uses a more restrictive Qwen research license. The model name is configurable (§3), but the default must remain an Apache-2.0 model.
 
-**Licence of every model in a ladder.** A model may be put into `model_ladder` or `model_ladder_server` (§3) only with its licence recorded in this table, and only Apache-2.0 or MIT models qualify.
+**Licence of every model in a ladder, and of every candidate.** A model may be put into any ladder (§3) only with its licence recorded in this table, and only Apache-2.0 or MIT models qualify. The same holds one step earlier: **before a candidate is evaluated** (§11.2), its licence, its current Ollama tag and its exact size in bytes (the model layer in the registry manifest, as in §6.22) are recorded here. A candidate whose licence is anything else is not evaluated.
 
-| Model | Ladder | Licence | Checked |
-|---|---|---|---|
-| `qwen2.5-coder:7b-instruct-q4_K_M` | server (and desktop when "try 7B first" is on, §6.22) | Apache-2.0 | Ollama library page, 2026-10-05 |
-| `qwen2.5-coder:1.5b-instruct-q4_K_M` | desktop, server | Apache-2.0 | Model licensing note above; re-check on its Ollama page at M10 |
-| `qwen2.5-coder:0.5b-instruct-q4_K_M` | desktop, server | Apache-2.0 | To be checked on its Ollama page at M10 |
+| Model | Status | Licence | Size (bytes) | Checked |
+|---|---|---|---|---|
+| `qwen2.5-coder:7b-instruct-q4_K_M` | In the server ladder (and desktop when "try the larger model first" is on, §6.22) | Apache-2.0 | 4,683,074,048 | Ollama library page and registry, 2026-10-05 |
+| `qwen2.5-coder:1.5b-instruct-q4_K_M` | In the desktop and server ladders | Apache-2.0 | 986,048,576 | Size: registry, 2026-10-05. Licence: model licensing note above; re-check on its Ollama page at M10 |
+| `qwen2.5-coder:0.5b-instruct-q4_K_M` | In the desktop and server ladders | Apache-2.0 | 397,808,000 | Size: registry, 2026-10-05. Licence to be checked on its Ollama page at M10 |
+| `qwen3:8b` | Candidate (server) | Apache-2.0 | 5,225,374,496 | Ollama library page (Q4_K_M) and registry, 2026-10-05 |
+| `qwen3:1.7b` | Candidate (desktop) | To check at M10 (its manifest carries a licence file of the same size as `qwen3:8b`'s) | 1,359,279,776 | Size: registry, 2026-10-05. Quantization of the default tag to confirm at M10 |
+| `qwen3:0.6b` | Candidate (desktop) | To check at M10 (same note) | 522,640,096 | Size: registry, 2026-10-05. Quantization of the default tag to confirm at M10 |
+
+**Pinning a candidate's tag.** Where an explicit `-q4_K_M` tag exists at M10 (as for the `qwen2.5-coder` entries), that tag is used and recorded, so the quantization cannot change under the name. Where only a default tag exists, the quantization it reports (`/api/show`, `details.quantization_level`) is recorded next to it. The table's rows for the Qwen3 candidates are updated at M10 accordingly.
 
 ---
 
@@ -202,6 +207,10 @@ coalescedb/
 │   ├── test_sql_import.py        # Postgres/MySQL/MSSQL/Oracle dump fixtures
 │   ├── test_export.py            # Incl. formula-injection cells
 │   ├── test_benchmark.py         # Fallback ladder with a fake Ollama
+│   ├── test_llm_client.py        # Think-block stripping, think switch, temperature, tasks (§11.1, M7)
+│   ├── test_llm_queue.py         # Model request queue (§11.1, M7)
+│   ├── test_task_ladders.py      # One ladder per task, one benchmark per model, loaded-models rule (§11.1, M7/M15)
+│   ├── test_analysis_queue.py    # Analytics job cap (§11.1, M17)
 │   ├── test_charts.py
 │   ├── test_analytics.py         # Known-answer datasets
 │   ├── test_forecasting.py
@@ -229,6 +238,8 @@ coalescedb/
 ├── packaging/
 │   ├── coalescedb.spec           # PyInstaller spec (§9.3)
 │   ├── fetch_ollama.py           # Downloads per-OS Ollama binary into resources/ (§9.2)
+│   ├── coalescedb.service        # systemd unit for the Linux server build (§9.3). Added at M11
+│   ├── SIZES.md                  # Measured build sizes per platform (§9.3). Added at M11
 │   └── resources/
 │       └── ollama/               # Bundled Ollama release, extracted (git-ignored)
 ├── assets/
@@ -237,10 +248,11 @@ coalescedb/
 │   └── fonts/                    # Geist + JetBrains Mono woff2 and their OFL.txt files (added at M6 with approval)
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                # ruff + pytest (no LLM needed)
+│       ├── ci.yml                # ruff + pytest (no LLM needed). Linux job from M24, all platforms from M12
 │       └── build.yml             # PyInstaller builds for Windows/macOS on tag
 ├── docker-compose.yml            # Optional: app + ollama containers for reviewers
 ├── Dockerfile
+├── Dockerfile.server             # Linux server image, CUDA and ROCm tags (§9.4). Added at M11
 ├── .env.example
 ├── .gitignore                    # databases/, *.db, models, build/, dist/, resources/ollama/
 ├── LICENSE                       # MIT
@@ -315,8 +327,36 @@ class Settings:
     model_ladder_server: tuple[str, ...] = ("qwen2.5-coder:7b-instruct-q4_K_M",
                                             "qwen2.5-coder:1.5b-instruct-q4_K_M",
                                             "qwen2.5-coder:0.5b-instruct-q4_K_M")
-        # Added at M15. The server variant of model_ladder: used in place of it when
-        # mode == "server". Code never reads either field directly; it calls ladder_for().
+        # Added at M7 (moved from M15 in the per-task round: the client needs a ladder per
+        # task and mode as soon as it exists; the benchmark that walks it is still M15).
+        # The server variant of model_ladder: used in place of it when mode == "server".
+        # Code never reads either field directly; it calls ladder_for().
+    # One ladder per AI task (per-task round; fields added at M7). Tasks: AI_TASKS = ("sql", "documents", "language"):
+    #   "sql"        text-to-SQL (§7.1)
+    #   "documents"  schema proposal and row extraction (§7.2, §7.3)
+    #   "language"   explanations and chart requests (§7.4, §7.5)
+    # model_ladder / model_ladder_server above are the "sql" ladders. The four below are
+    # None by default, and None means "use the sql ladder of the same mode". So every
+    # task uses today's ladders until an eval decision (§11.2) changes a default here.
+    documents_ladder: tuple[str, ...] | None = None
+    documents_ladder_server: tuple[str, ...] | None = None
+    language_ladder: tuple[str, ...] | None = None
+    language_ladder_server: tuple[str, ...] | None = None
+    model_temperatures: tuple[tuple[str, float], ...] = ()
+        # Added at M7. Temperature per model name; a model not listed uses llm_temperature
+        # (0.0). Env form: COALESCEDB_MODEL_TEMPERATURES="qwen3:8b=0.7,qwen3:1.7b=0.7".
+        # Empty by default, so every model runs at 0 until an eval result says otherwise.
+    ollama_managed: bool = False
+        # Added at M11/M15. True only when this app's sidecar started Ollama: the launcher
+        # sets COALESCEDB_OLLAMA_MANAGED=1 next to COALESCEDB_OLLAMA_HOST (§9.1). False
+        # means the administrator's or user's own Ollama is in use, whose settings the app
+        # cannot change (§6.22 "Different models for different tasks").
+    model_switch_notice_s: float = 3.0
+        # Added at M15. A model switch that takes longer than this shows "Loading model"
+        # (§6.22). Provisional: confirmed or changed from the switch delay measured at M15.
+    candidate_models: tuple[str, ...] = ()
+        # Added at M10. Extra models that evals/run_evals.py compares (§11.2). The app
+        # itself never reads it: a model is used by the app only through a ladder.
     llm_parallel_server: int = 3
         # Added at M7 (queue) and used at M15 (benchmark). ONE number for three things in
         # server mode: Ollama's OLLAMA_NUM_PARALLEL when the sidecar starts it (§9.2), the
@@ -327,6 +367,12 @@ class Settings:
         # Empty until M20 ships fine-tuned models, e.g. ("coalescedb-sql:1.5b", "coalescedb-sql:0.5b").
         # When non-empty, each fine-tuned model is tried in place of the stock model of the same
         # size; if its download or checksum fails, the stock model is used instead.
+        # Applies to the "sql" task (and to every task that shares the sql ladder).
+    finetuned_models: tuple[tuple[str, str, str], ...] = ()
+        # Added at M20, only if a per-task fine-tune or adapter ships (§16.5 options b, c).
+        # Entries are (task, stock model, fine-tuned model): for that task, the fine-tuned
+        # model is tried in place of that stock model, with the same fallback. Empty by
+        # default; finetuned_ladder keeps working as it does today.
     benchmark_min_gen_tps: float = 20.0      # Generation speed required to enable AI
     benchmark_min_prompt_tps: float = 150.0  # Prompt-reading speed required for PDF import
     benchmark_runs: int = 3                  # Median of N runs after one warm-up
@@ -349,13 +395,23 @@ class Settings:
     max_analysis_queue: int = 10             # Added at M17. Analytics jobs allowed to wait
 
     def ladder_for(self, task: str = "sql", *, try_7b_first: bool = False) -> tuple[str, ...]:
-        # Added at M15. The ONLY way code gets a ladder. Today there is one task, "sql":
-        #   server mode  -> model_ladder_server
-        #   desktop mode -> model_ladder, with the 7B model put in front when try_7b_first
-        #                   is True (the superadmin switch in app_settings, §6.22; off by default)
-        # Any other task name raises ValueError. A later spec round adds per-task ladders
-        # ("sql", "documents", "language"): each task then gets its own field and its own
-        # `_server` variant, and this method picks between them. Nothing is renamed.
+        # Added at M7 (moved from M15, see model_ladder_server). The ONLY way code gets a ladder.
+        #   task "sql":        model_ladder (desktop)      / model_ladder_server (server)
+        #   task "documents":  documents_ladder            / documents_ladder_server
+        #   task "language":   language_ladder             / language_ladder_server
+        # A field that is None falls back to the sql ladder of the same mode.
+        # Desktop mode with try_7b_first=True (the superadmin switch in app_settings,
+        # §6.22; off by default): the FIRST model of that task's server ladder is put in
+        # front, unless it is already there. (The parameter keeps its name from the
+        # server-mode round; with today's ladders that model is the 7B.)
+        # Any task not in AI_TASKS raises ValueError. An empty ladder raises when
+        # settings load, like model_ladder.
+    def default_model_for(self, task: str = "sql") -> str:
+        # Added at M7: ladder_for(task)[0]. The interim source of truth per task, exactly
+        # as default_model is for desktop "sql" (below); from M15 on the app uses
+        # AIStatus.active_models (§5) and never falls back to this.
+    def temperature_for(self, model: str) -> float:
+        # Added at M7: the model's entry in model_temperatures, else llm_temperature.
 
     @property
     def default_model(self) -> str:
@@ -513,6 +569,7 @@ class LLMCall:
     completion_tokens: int | None
     latency_ms: float
     model: str
+    temperature: float | None = None   # Added at M7: the temperature this call used (§6.10)
 
 @dataclass(frozen=True)
 class SQLGeneration:
@@ -547,6 +604,30 @@ class AIStatus:
     pending_downloads: list[tuple[str, int]]   # (model name, size in bytes) awaiting consent
     download_progress: tuple[int, int] | None  # (bytes done, total) while downloading
 ```
+
+**`AIStatus` per task (changed at M15, when the benchmark first fills it).** The class above is the M1 form. No test builds an `AIStatus`, and nothing reads it before M15, so M15 changes it as follows without touching a test:
+
+```python
+AI_TASKS: tuple[str, ...] = ("sql", "documents", "language")      # also used by Settings (§3)
+
+    # In AIStatus:
+    active_models: Mapping[str, str | None]    # task -> the model the app calls for it, or None
+                                               # (that task is off). Replaces the single field as
+                                               # the ONLY source of truth for which model is called
+    task_reasons: Mapping[str, str]            # task -> why it is off, or "" (shown on hover, §8.2)
+    max_loaded_models: int = 1                 # 1 or 2: what Ollama was started with (§6.22, §9.2)
+    loaded_models_reason: str = ""             # Why, in plain words, e.g. "Two models are in use and
+                                               # both fit in memory." / "Ollama is not managed by
+                                               # CoalesceDB, so the memory check adds the models together."
+    @property
+    def active_model(self) -> str | None: ...  # active_models.get("sql"); kept so older callers and
+                                               # the status-bar text still read one name
+    def task_enabled(self, task: str) -> bool: ...   # state == "ready" and active_models.get(task)
+    @property
+    def total_download_bytes(self) -> int: ... # Sum over pending_downloads (each distinct model once)
+```
+
+`enabled` stays "state == ready", which now means at least one task has a model. `pdf_import_enabled` is about the "documents" task (§6.22).
 
 ---
 
@@ -1155,6 +1236,14 @@ def wrap_untrusted(text: str, label: str = "DOCUMENT") -> str: ...
     # (except \n\t), then wraps: "<<<DOCUMENT_START>>>\n{text}\n<<<DOCUMENT_END>>>"
 def strip_code_fences(llm_text: str) -> str: ...
     # Extracts SQL from ```sql ... ``` if present; trims prose.
+def strip_think_blocks(llm_text: str) -> str: ...
+    # Added at M7. Removes every <think>...</think> block (tag matched case-insensitively,
+    # across lines), and an opening <think> that is never closed together with everything
+    # after it. Returns what is left, stripped of surrounding whitespace. A response that
+    # was only a think block therefore becomes "" and is treated as an empty response.
+    # Text without such a block is returned unchanged (apart from the outer strip).
+    # Applied inside OllamaClient (§6.10) to every response, before strip_code_fences
+    # and before JSON validation.
 ```
 
 Prompt wording alone is **not** relied on. The real guarantees are structural:
@@ -1170,10 +1259,13 @@ Prompt wording alone is **not** relied on. The real guarantees are structural:
 class LLMClient(Protocol):
     def health(self) -> tuple[bool, str]: ...          # (ok, message) — model present?
     def complete(self, system: str, user: str, *, model: str | None = None,
-                 max_tokens: int = 512) -> LLMCall: ...
+                 max_tokens: int = 512, task: str = "sql") -> LLMCall: ...
     def complete_json(self, system: str, user: str, schema: type[BaseModel], *,
                       model: str | None = None, max_retries: int = 2,
-                      max_tokens: int = 2048) -> tuple[BaseModel, list[LLMCall]]: ...
+                      max_tokens: int = 2048, task: str = "sql"
+                      ) -> tuple[BaseModel, list[LLMCall]]: ...
+    # task: one of AI_TASKS (§3). It only chooses WHICH model is called when `model` is
+    # not given; see "Tasks, thinking and temperature" below.
 
 class OllamaClient:
     def __init__(self, settings: Settings) -> None: ...
@@ -1194,6 +1286,24 @@ class OllamaClient:
 
 class FakeLLMClient:   # tests/conftest.py — returns scripted responses; used by CI
 ```
+
+**Tasks, thinking and temperature (M7).**
+
+- **Which task a call belongs to.** Every caller names its task; the default `"sql"` keeps a caller that does not name one on today's model.
+
+  | Caller | Task |
+  |---|---|
+  | `generate_sql` (§6.11) | `"sql"` |
+  | Schema proposal (§6.13) and row extraction (§6.14) | `"documents"` |
+  | Explanations (§6.26) and chart requests (§6.23) | `"language"` |
+
+- **Model resolution per task.** The order above stays, read per task: (1) the explicit `model` argument; (2) `AIStatus.active_models[task]` (M15+); (3) M7–M14 only: `settings.default_model_for(task)`. From M15, no explicit `model` and no active model for that task → `LLMUnavailable` with that task's reason (`AIStatus.task_reasons[task]`); a task that is off never borrows another task's model.
+- **Thinking is switched off.** Some models (Qwen3 among them) write out their reasoning before the answer by default. That costs time and tokens and would break SQL and JSON parsing. Ollama's `/api/chat` has a `think` field (`true`, `false`, or a level; when it is left out the model's own default applies) and returns any thinking text separately in `message.thinking`; `/api/show` lists `"thinking"` under `capabilities` for models that support it. Checked 2026-10-05 in Ollama's documentation and with `/api/show` on the installed Ollama 0.33.2 (a thinking model there reports the capability, `qwen2.5-coder` does not). So:
+  - Once per model (cached), the client asks `POST /api/show` and looks for `"thinking"` in `capabilities`. If it is there, every request for that model carries `"think": false`. If it is not, the field is not sent at all, because what Ollama answers to `think: false` on a model without the capability has not been checked (M7 check, §15).
+  - `message.thinking` is never read into `LLMCall.text`, never shown, logged or traced.
+  - **Safety net:** whatever comes back in `message.content` goes through `strip_think_blocks` (§6.9) first. If the result is empty, `complete` treats it as an empty response and `complete_json` as a validation failure (so it is retried, then `LLMOutputInvalid`).
+  - Not verified yet: that `think: false` fully silences the Qwen3 models on the installed Ollama. No Qwen3 model was installed when this was written; it is an M10 check before any Qwen3 eval (§11.2).
+- **Temperature per model.** The request's temperature is `settings.temperature_for(model)` (§3): 0 unless `model_temperatures` names the model. The value used is stored in `LLMCall.temperature`, and the evals write it next to each model's results (§11.2). Nothing else about sampling is configurable.
 
 **Model request queue (M7, both modes).** One model serves everyone on a server, so requests are queued by the app, not left to Ollama alone.
 
@@ -1228,7 +1338,7 @@ def generate_sql(llm: LLMClient, executor: Executor, session: Session,
 Flow:
 
 1. Build prompt from §7.1 with `schema_ddl()`, 3 `sample_rows` per table, the role (so a viewer's model is told SELECT only), and the question wrapped via `wrap_untrusted(question, "QUESTION")`.
-2. `complete()` → `strip_code_fences()` → `validate()`.
+2. `complete(task="sql")` (which strips any think block, §6.10) → `strip_code_fences()` → `validate()`.
 3. **One self-correction round**, triggered by either:
    - the guard rejecting with a **parse error** (`SQLParseError`), or
    - the guard allowing the statement but a **dry run** failing: call
@@ -1353,7 +1463,7 @@ class ExtractionPlan(BaseModel):
 
 def extract_rows(llm: LLMClient, pages: list[str], table: TableInfo,
                  context: dict[str, str]) -> tuple[list[dict], list[LLMCall]]: ...
-    # Per relevant chunk: complete_json with a wrapper model {"rows": list[RowModel]}.
+    # Per relevant chunk: complete_json (task="documents", §6.10) with a wrapper model {"rows": list[RowModel]}.
     # "context" carries values from earlier passes (e.g. known grading categories)
     # so categorical values stay consistent — the two-pass pattern.
     # Merges chunks, dedupes by normalized full-row equality.
@@ -1574,6 +1684,11 @@ KNOWN_MODEL_SIZES: dict[str, int] = {
     "qwen2.5-coder:7b-instruct-q4_K_M":   4_683_074_048,
     "qwen2.5-coder:1.5b-instruct-q4_K_M":   986_048_576,
     "qwen2.5-coder:0.5b-instruct-q4_K_M":   397_808_000,
+    # Eval candidates (§11.2), not in any ladder. Default tags as read 2026-10-05; if M10
+    # uses explicit -q4_K_M tags, the keys and sizes are replaced then (§1).
+    "qwen3:8b":                           5_225_374_496,
+    "qwen3:1.7b":                         1_359_279_776,
+    "qwen3:0.6b":                           522_640_096,
 }
 # Pinned stock-model sizes for the consent screen and the RAM rule, in exact bytes: the
 # size of the model layer in each tag's manifest on registry.ollama.ai (read 2026-10-05).
@@ -1619,30 +1734,61 @@ Ollama's `eval_duration` does not include the time a request spent waiting in Ol
 1. If `settings.ollama_host` does not answer `GET /api/version` → `state="ollama_unavailable"`, `enabled=False`. No sidecar object is consulted.
 2. `ai_mode_override == "force_off"` → AI disabled, reason "Turned off in settings".
 3. If `benchmark.json` has a result for this `machine_fingerprint` that is under 30 days old and `force` is False, reuse it.
-4. Otherwise, for each model in `settings.ladder_for("sql", try_7b_first=...)` (§3), biggest first (desktop: 1.5B, then 0.5B; server: 7B, then 1.5B, then 0.5B), using the fine-tuned model from `finetuned_ladder` if one of that size is configured and installed, else the stock model (there is no fine-tuned 7B):
+4. Otherwise, **for each task** (see "One ladder per task" below; with the default settings all three tasks have the same ladder, so this is one walk): for each model in `settings.ladder_for(task, try_7b_first=...)` (§3), biggest first (desktop: 1.5B, then 0.5B; server: 7B, then 1.5B, then 0.5B), using the fine-tuned model from `finetuned_ladder` if one of that size is configured and installed, else the stock model (there is no fine-tuned 7B):
    - **RAM rule.** Skip it (reason recorded) if free RAM (`psutil.virtual_memory().available`) is below `1.5 × file size + (slots − 1) × CONTEXT_BYTES_PER_SLOT[model]`, where `slots` is `llm_parallel_server` in server mode and 1 in desktop mode. In desktop mode this is the old rule, 1.5× the file size. Example, server mode with 3 slots: the 7B model needs about 7.0 GB + 2 × 0.47 GB ≈ 8.0 GB free (provisional, see `CONTEXT_BYTES_PER_SLOT`).
    - If it isn't installed: set `state="needs_download_consent"`, add it to `pending_downloads` with its size from `KNOWN_MODEL_SIZES` (stock) or `ModelArtifact.size_bytes` (fine-tuned), and **stop the background check there**. The worker thread never tries to show anything itself.
    - Benchmark it. If `gen_tps ≥ benchmark_min_gen_tps` (in server mode: the parallel rule below), select it and stop. Before trying the next, smaller model, unload this one (`keep_alive: 0`) to free memory.
-5. If no model passes → AI disabled. Reason example: "AI features need 20 tokens/s. This computer reached 9.4 tokens/s with the smallest model. Query builder, SQL, import, export, charts and analytics still work."
-6. `pdf_import_enabled = enabled and prompt_tps ≥ benchmark_min_prompt_tps and active_model allows it` (see feature gating below).
+5. If no model passes for a task → that task is off, with the reason. If no task has a model → AI disabled. Reason example: "AI features need 20 tokens/s. This computer reached 9.4 tokens/s with the smallest model. Query builder, SQL, import, export, charts and analytics still work."
+6. `pdf_import_enabled = task_enabled("documents") and prompt_tps ≥ benchmark_min_prompt_tps and the documents model allows it` (`prompt_tps` of the model chosen for "documents"; see feature gating below).
 7. `force_on` skips the threshold but still benchmarks, and shows the amber status text "Model is slow on this computer (<n> tokens/s)".
+
+**One ladder per task (M15).** There are three AI tasks (§3: "sql", "documents", "language"), each with its own ladder from `ladder_for(task)`.
+
+- Steps 4 to 6 run per task and fill `AIStatus.active_models` and `task_reasons` (§5). **By default the three ladders are the same**, so the outcome is what it was before: one model, tested once, used for everything.
+- **Each distinct model is tested once.** `resolve_ai_status` keeps the results of one run in a table keyed by model name. A model that appears in a second task's ladder is not benchmarked, RAM-checked or downloaded again: its recorded pass or fail is reused. `benchmark.json` stores the result per model, plus the model chosen per task.
+- The benchmark prompt stays the §7.1 text-to-SQL prompt for every model. It measures how fast this computer runs the model, not how good the model is at a task; quality per task is what the evals measure (§11.2).
+- A task whose every model fails is off **on its own**; the other tasks stay on (feature gating below). A task that is off never uses another task's model.
+- Fine-tuned models per task come from `finetuned_models` (§3), with the same "stock model if the download or checksum fails" fallback as `finetuned_ladder`.
+
+**Different models for different tasks: memory and switching (M15).** As long as every task uses the same model there is nothing to decide. When an eval decision (§11.2) gives a task its own model, two things cost something:
+
+- **What Ollama does.** Ollama keeps a model in memory for a while after a request (`keep_alive`, 5 minutes by default) and can hold several models at once, up to `OLLAMA_MAX_LOADED_MODELS`, each with its own memory. A request for a model that is not loaded makes Ollama load it first, and unload another if the limit is reached. So a second model either needs its own memory, or is loaded on demand each time the task changes.
+- **Each model's own RAM rule is unchanged** (step 4: `1.5 × file size + (slots − 1) × CONTEXT_BYTES_PER_SLOT`, with the parallel slots in server mode). A model that passes it stays usable whatever follows.
+- **One or two loaded, decided per computer.** When this app's sidecar starts Ollama (`ollama_managed`, §9.2), it sets `OLLAMA_MAX_LOADED_MODELS`: if free RAM covers the sum of the RAM rules of every distinct model the tasks use, the number of distinct models, at most 2; otherwise 1. **A model that passes its own RAM rule is never disabled just because two cannot be loaded together.** With 1, changing task reloads the model.
+- **When that is decided.** The sidecar starts before the benchmark has chosen the models. It therefore uses the per-task choice stored in `benchmark.json` from the last run and the free RAM at that moment. With no stored choice (first start, or a changed fingerprint) it starts with 1. If the benchmark then ends with two distinct models that would fit together, nothing is restarted: `loaded_models_reason` says "Two models are in use. Both will stay loaded from the next start.", and until then they are switched on demand.
+- **Switch delay.** M15 measures how long a switch takes for each pair of ladder models and records it in `evals/results.md`. The delay is shown nowhere unless a request has waited longer than `model_switch_notice_s` for its model, and then only as the text "Loading model" in the place where the result will appear (the same place as the queue text, §6.10).
+- **An Ollama the app did not start** (`ollama_managed` false: the administrator's or the user's own). The app cannot set its limit, and Ollama's default allows several models at once. So there the RAM rule **adds the models together**: a task's candidate that is not yet chosen for another task must fit next to the ones already chosen (`its own rule + the rules of the distinct models already selected`). If it does not, that task goes on down its ladder, where a model another task already uses costs nothing extra. The status panel says so: "Ollama is not managed by CoalesceDB, so the memory check adds the models together."
+- `AIStatus.max_loaded_models` and `loaded_models_reason` record the choice and the reason (§5); they are shown in the status bar's model panel and on the Admin page.
+- With one model loaded and several people on a server, two users alternating between tasks make Ollama reload on every request. That is the main reason the evals give a task its own model only for a clear gain (§11.2).
 
 **When it runs:** in a background thread *after* the window opens, so startup is never blocked. While it runs, the status bar shows "Checking model speed…" and all non-AI features are usable. Superadmins have a **Re-run benchmark** button on the Admin page.
 
 **Threading rule (NiceGUI):** background threads never create, change or delete UI elements and never call `ui.notify` or any other `ui.*` function. The worker only updates a shared `AIStatus` object (behind a `threading.Lock`, held by the app-wide services object that `ui/main.py` creates once at startup). The UI polls it: the shell (§8.2) reads `AIStatus` once on every page load and runs a `ui.timer(2.0, ...)` on each open page that copies the current state into the status bar, touching the elements only when the state has changed. The timer callback runs on NiceGUI's event loop in that page's context, which is the only place UI elements may be updated.
 
-**Download consent flow:** when `state == "needs_download_consent"`, the model item in the status bar shows "AI features need a one-time download (<size>)." and opens a small panel with **Download model** and **Not now** buttons. **Download model** (a normal button click, handled on the event loop) starts a worker thread that downloads with progress into `download_progress`, then resumes the ladder at step 3. **Not now** sets `state="disabled"` with the reason "Model not downloaded", and offers the button again on the Admin page.
+**Download consent flow:** when `state == "needs_download_consent"`, the model item in the status bar shows "AI features need a one-time download (<size>)." and opens a small panel with **Download model** and **Not now** buttons. `<size>` is the total. When more than one distinct model is missing (tasks with different models, "One ladder per task" above), the panel lists each one once, with its size, and the total: for example "qwen2.5-coder 7B · 4.7 GB", "qwen2.5-coder 1.5B · 986 MB", "Total 5.7 GB" (decimal units, as Ollama shows them; from `pending_downloads` and `total_download_bytes`, §5). A model needed by two tasks appears once. The button then reads **Download models**; one consent covers the list. The step "stop the background check there" applies once all tasks have been walked as far as they can go without a download, so the list is complete. **Download model** (a normal button click, handled on the event loop) starts a worker thread that downloads with progress into `download_progress`, then resumes the ladder at step 3. **Not now** sets `state="disabled"` with the reason "Model not downloaded", and offers the button again on the Admin page.
 
 **Machine fingerprint:** SHA-256 of CPU model (`platform.processor()` or, if that is empty, `platform.machine()` — do **not** shell out to `sysctl`; `test_no_code_execution.py` forbids `subprocess` outside `llm/sidecar.py`), total RAM (`psutil`), OS name and version, Ollama version (`GET /api/version`) and the model's digest. **Digest source:** `GET /api/tags` (the list entry for `model` has `digest`). Do not read digest from `POST /api/show`: Ollama 0.33+ often omits it there. GPU name is not included: there's no reliable cross-platform way to read it without extra dependencies, and the model digest + Ollama version already change when the setup changes.
 
-**Feature gating by model** (config table, adjustable once §11.2 evals exist):
+**Feature gating by task and model** (config table, adjustable once §11.2 evals exist). Each feature belongs to one task and is on when **that task** has an active model (`AIStatus.task_enabled(task)`) and the table allows the feature for that model. The model columns refer to the model active for the feature's own task, which can differ from task to task.
 
-| Feature | 7B | 1.5B | 0.5B |
+| Feature | Task | 7B | 1.5B | 0.5B |
+|---|---|---|---|---|
+| Generate SQL | sql | ✓ | ✓ | ✓ |
+| PDF → new database (schema design) | documents | ✓ | ✓ | ✗ by default |
+| PDF → fill rows | documents | ✓ | ✓ | Only if extraction evals pass the threshold in §11.2 |
+| Plain-English explanations ("Simplify wording") | language | ✓ | ✓ | ✓ (number check makes this safe) |
+| Describe chart | language | ✓ | ✓ | ✓ (the result is a validated `ChartSpec`) |
+
+Tasks are on or off independently:
+
+| "sql" | "documents" | "language" | What the user has |
 |---|---|---|---|
-| Generate SQL | ✓ | ✓ | ✓ |
-| Plain-English explanations | ✓ | ✓ | ✓ (number check makes this safe) |
-| PDF → new database (schema design) | ✓ | ✓ | ✗ by default |
-| PDF → fill rows | ✓ | ✓ | Only if extraction evals pass the threshold in §11.2 |
+| on | on | on | Everything |
+| on | off | on | Generate SQL and explanations; the PDF tabs show the documents task's reason |
+| off | on | on | PDF import and explanations; Generate SQL is hidden and the Query page opens in Build query |
+| off | off | off | AI disabled (the text below) |
+
+Any other combination works the same way: each feature looks only at its own task. A candidate model that enters a ladder (§11.2) gets its own column by the same spec change.
 
 The 7B column is provisional until the §11.2 evals have run it (M10).
 
@@ -1671,7 +1817,7 @@ APP_SETTING_KEYS = {"desktop_try_7b": bool}       # default False
 
 **Server mode: who may start a download or a benchmark.** The server's model belongs to everyone, and the 7B download is 4.7 GB. In server mode the download consent panel's buttons and **Re-run benchmark** are shown to superadmins only and are re-checked on click (`require_superadmin`); everyone else sees the state as text ("AI features need a one-time download. Ask an administrator.").
 
-**UI when AI is disabled:** the "Generate SQL" mode is hidden and the Query page opens in "Build query" (the builder, §6.27, is the default mode in every case and needs no model; "Write SQL (advanced)" stays available); PDF import tabs show the reason instead of the uploader; explanations show the deterministic text only (§6.26); the status bar shows the amber text "AI features disabled. Model too slow on this computer." with the full reason on hover. AI state lives in `AIStatus` held by the services object; it is not an environment variable.
+**UI when a task or all of AI is disabled:** with only one task off, only that task's features change, as in the table above, each showing its own reason. With every task off: the "Generate SQL" mode is hidden and the Query page opens in "Build query" (the builder, §6.27, is the default mode in every case and needs no model; "Write SQL (advanced)" stays available); PDF import tabs show the reason instead of the uploader; explanations show the deterministic text only (§6.26); the status bar shows the amber text "AI features disabled. Model too slow on this computer." with the full reason on hover. AI state lives in `AIStatus` held by the services object; it is not an environment variable.
 
 **`model_store.py`** installs the fine-tuned models from §16:
 ```python
@@ -1703,6 +1849,8 @@ def ensure_model(client: OllamaClient, artifact: ModelArtifact,
     "stream": false}
    ```
 5. Delete the temporary file. On any failure, fall back to the stock model of the same size via `/api/pull`.
+
+**Which fine-tune is registered (M20).** `model_store` registers whichever packaging option of §16.5 ships: one combined model (a), two adapter-based models that share the base file (b), or two merged models (c). For (b) the artifact also names the adapter file and the base model it must sit on, and `ensure_model` registers it with the request shape verified at M20 (§16.5); nothing about (b) is built before that check. In every case each task's ladder names its model through `finetuned_ladder` / `finetuned_models` (§3), and the fallback to the stock model is unchanged.
 
 Check these request shapes against the installed Ollama's API docs during M15; `test_benchmark.py` uses a fake server that enforces this exact shape.
 
@@ -1747,7 +1895,7 @@ def suggest_charts(df: pd.DataFrame) -> list[ChartSpec]: ...
 
 All titles and labels that come from data (column names, category values) are escaped (`<` → `&lt;`, `>` → `&gt;`) before going into Plotly, which interprets some HTML tags in text.
 
-Optional, AI-on only: "Describe the chart you want" sends the column names and types (not rows) to the model, which returns a `ChartSpec` as JSON via `complete_json`. It is validated with `validate_spec` and shown in the editable chart form. The model never writes plotting code.
+Optional, AI-on only: "Describe the chart you want" sends the column names and types (not rows) to the model, which returns a `ChartSpec` as JSON via `complete_json` (`task="language"`, §6.10). It is validated with `validate_spec` and shown in the editable chart form. The model never writes plotting code.
 
 ### 6.24 Profiling & Modeling — `analytics/profiling.py`, `analytics/modeling.py`
 
@@ -2424,6 +2572,7 @@ def main() -> None:
     os.environ["NICEGUI_STORAGE_PATH"] = str(settings.ui_storage_dir)   # Before NiceGUI is imported (§8.6)
     sidecar = OllamaSidecar(settings); sidecar.ensure_running()         # §9.2, non-fatal on failure
     os.environ["COALESCEDB_OLLAMA_HOST"] = sidecar.effective_host       # load_settings() in ui.main reads it
+    os.environ["COALESCEDB_OLLAMA_MANAGED"] = "1" if sidecar.started_by_us else "0"   # §3 ollama_managed, §6.22
 
     from nicegui import app
     from coalescedb.ui import main as ui_main      # Imported here, after the environment is set
@@ -2486,6 +2635,7 @@ def create_superadmin(settings: Settings, *, read_line: Callable[[str], str] = i
 class OllamaSidecar:
     effective_host: str           # Host the app should call: settings.ollama_host, or
                                   # http://127.0.0.1:<free-port> if this sidecar started Ollama
+    started_by_us: bool           # True only if this sidecar started Ollama (§3 ollama_managed)
     def ensure_running(self) -> SidecarStatus: ...
         # 1. If settings.ollama_host answers GET /api/version → use it (user already has Ollama);
         #    set effective_host = settings.ollama_host.
@@ -2493,8 +2643,12 @@ class OllamaSidecar:
         #    → shutil.which("ollama").
         # 3. Start `ollama serve` with env OLLAMA_HOST=127.0.0.1:<free port>,
         #    OLLAMA_MODELS=<data_dir>/models; set effective_host to that URL; wait for /api/version.
-        #    Server mode also sets OLLAMA_NUM_PARALLEL=<llm_parallel_server> and
-        #    OLLAMA_MAX_LOADED_MODELS=1 (§6.10, §6.22). Always 127.0.0.1, in every mode: the
+        #    Server mode also sets OLLAMA_NUM_PARALLEL=<llm_parallel_server> (§6.10, §6.22).
+        #    Both modes set OLLAMA_MAX_LOADED_MODELS to 1 or 2 by the rule in §6.22
+        #    ("Different models for different tasks"): 2 only if the tasks use two distinct
+        #    models and free RAM covers both; decided from benchmark.json before the start,
+        #    1 when there is no stored choice. (This replaces the fixed 1 of the server-mode
+        #    round.) Sets started_by_us = True. Always 127.0.0.1, in every mode: the
         #    model's port is never opened to the network.
         # 4. Model installation is NOT done here. resolve_ai_status (§6.22) runs in a
         #    background thread after the window opens and installs models on demand through
@@ -2508,7 +2662,21 @@ class OllamaSidecar:
     def stop(self) -> None: ...     # Only stops a process this sidecar started
 ```
 
-`packaging/fetch_ollama.py` downloads the official Ollama release archive for the build OS and **extracts the whole thing** into `packaging/resources/ollama/`, keeping its folder layout. Ollama ships as a binary plus a folder of libraries (CPU/GPU runners), not a single file, and it finds those libraries relative to its own location. The script records which file is the executable, verifies the download's checksum where Ollama publishes one, and fails the build if the layout isn't what it expects. Check the current release layout on Ollama's GitHub releases page when writing this script. Bundling it makes the installer large (the Ollama runtime with GPU libraries is hundreds of MB); a "lite" build without it is also produced for users who already have Ollama. Include Ollama's MIT license text in the bundle.
+`packaging/fetch_ollama.py` downloads the official Ollama release archive for the build OS and **extracts the whole thing** into `packaging/resources/ollama/`, keeping its folder layout. Ollama ships as a binary plus a folder of libraries (CPU/GPU runners), not a single file, and it finds those libraries relative to its own location. The script records which file is the executable, verifies the download's checksum where Ollama publishes one, and fails the build if the layout isn't what it expects. Check the current release layout on Ollama's GitHub releases page when writing this script. Bundling it makes the installer large; a "lite" build without it is also produced for users who already have Ollama. Include Ollama's MIT license text in the bundle.
+
+**GPU support in the bundle (M11).**
+
+| Platform | Build | Ollama archive bundled | GPU libraries |
+|---|---|---|---|
+| Windows (x64) | Desktop, also runs as a server | The standard Windows archive plus the ROCm add-on archive, where the shipped Ollama version provides one | NVIDIA CUDA; AMD ROCm |
+| Linux (x64) | **Server only** (§9.3) | The standard Linux archive | NVIDIA CUDA. AMD ROCm is a **separate variant** (its own archive and Docker tag, §9.4), not part of the same download |
+| macOS | Desktop, also runs as a server | The standard macOS binary | Metal, which is built into it; nothing extra |
+
+- **No GPU drivers are bundled.** Drivers come from the operating system or the GPU vendor. The bundle holds only the libraries Ollama itself ships.
+- **A missing or unusable GPU is never an error.** Ollama then runs on the CPU, the §6.22 benchmark measures what that computer really reaches, and the ladder picks a smaller model or turns AI off. The app starts and every non-AI feature works on any machine; nothing in the app checks for a GPU.
+- Seen on 2026-10-05, for orientation only (the numbers are re-read at M11 for the version that ships): release v0.35.1 has a Windows archive of about 1,471 MB with a ROCm add-on of about 256 MB, a Linux archive of about 1,440 MB with a ROCm archive of about 1,053 MB, and a macOS archive of about 160 MB. Ollama's GPU page for that version names NVIDIA cards with compute capability 5.0 or higher and driver 550 or newer, AMD cards through ROCm v7 (a longer list on Linux than on Windows), and Apple GPUs through Metal. Releases also carry `-mlx` variants and a Vulkan backend; neither is bundled or relied on.
+- **Before building at M11** (acceptance, §15): (1) read and record the redistribution terms of the GPU libraries inside the Ollama archives that will be shipped (NVIDIA's CUDA runtime libraries and AMD's ROCm libraries are not under Ollama's MIT licence); if a library may not be redistributed in our bundle, STOP and ask, and do not ship it; include the licence texts the terms require. (2) List the GPUs the shipped Ollama version supports, from its own documentation, for the README.
+- `fetch_ollama.py` takes the platform and the variant (`cuda`, `rocm`) and verifies each archive's checksum against the release's `sha256sum.txt`.
 
 ### 9.3 PyInstaller — `packaging/coalescedb.spec`
 
@@ -2524,11 +2692,15 @@ class OllamaSidecar:
 - `multiprocessing.freeze_support()` stays the first statement in the launcher's main guard (§9.1). `reload=False` is required in a packaged NiceGUI app (§8.6).
 - Build check: after building, run `dist/CoalesceDB/CoalesceDB --browser` from a terminal and load every page once; an `ImportError` there means a missing hidden import. Then start it normally and check that the desktop window opens and that closing it ends the process and the sidecar.
 - Output: `dist/CoalesceDB/` → zipped for Windows; `.app` then `.dmg` on macOS.
+- **Linux server build (M11).** A third build, for server mode only: headless, started with `--server`, no desktop window. `collect_all("webview")` is left out and pywebview is not installed in that build, so the launcher's `pywebview_available()` is false and `--server` never needs it. Output: `dist/CoalesceDB/` as a `.tar.gz` with a `systemd` unit file (`packaging/coalescedb.service`: runs as its own unprivileged user, restarts on failure, reads its `COALESCEDB_` variables from an environment file readable only by that user). Two variants: with Ollama + CUDA (default) and with Ollama + ROCm. A Linux **desktop** build is not produced (§13); Linux desktop users can run from source.
+- **Size report (M11 acceptance).** For each platform and variant, record in `packaging/SIZES.md`: the built app's size unpacked and compressed; the five largest packages in it; and the size of the bundled Ollama with its GPU libraries, separately. The README's download-size line comes from this file.
 - Code signing is out of scope for v1; README explains the Windows SmartScreen / macOS Gatekeeper prompt.
 
-### 9.4 Docker (optional, for reviewers)
+### 9.4 Docker (optional, for reviewers; and the Linux server image)
 
-`docker-compose.yml` with `ollama/ollama` and the app container; an init step pulls the model. App container sets `COALESCEDB_OLLAMA_HOST=http://ollama:11434` runs `python launcher.py --browser`, and sets `COALESCEDB_BIND_HOST=0.0.0.0` and `COALESCEDB_PORT=8080` so NiceGUI listens on `0.0.0.0` *inside* the container only, with the port published to `127.0.0.1:8080` on the host. `COALESCEDB_BIND_HOST` is read by `load_settings` into `Settings.bind_host` (§3) and `COALESCEDB_PORT` by the launcher; only the Docker image sets them (§8.6). The container runs in desktop mode: plain HTTP, reachable only through the port published on the host's `127.0.0.1`. It is not a way to run a server for a network; that is server mode (§9.1). The Host and Origin checks stay on.
+`docker-compose.yml` with `ollama/ollama` and the app container; an init step pulls the model. App container sets `COALESCEDB_OLLAMA_HOST=http://ollama:11434` runs `python launcher.py --browser`, and sets `COALESCEDB_BIND_HOST=0.0.0.0` and `COALESCEDB_PORT=8080` so NiceGUI listens on `0.0.0.0` *inside* the container only, with the port published to `127.0.0.1:8080` on the host. `COALESCEDB_BIND_HOST` is read by `load_settings` into `Settings.bind_host` (§3) and `COALESCEDB_PORT` by the launcher; only the Docker image sets them (§8.6). The container runs in desktop mode: plain HTTP, reachable only through the port published on the host's `127.0.0.1`. It is not a way to run a server for a network; that is server mode (§9.1).
+
+**Server image (M11).** A second image, `Dockerfile.server`, is the Linux server build of §9.3 in a container: it runs `--server` (HTTPS with the administrator's certificate and key mounted read-only, `allowed_hosts` and the other `COALESCEDB_` variables from the environment, §9.1), keeps `data_dir` on a mounted **local** volume of the host (never a network share, §6.3), runs as a non-root user, and starts the bundled Ollama inside the same container on `127.0.0.1` (so the model's port is not published). Two tags: `:<version>` with CUDA and `:<version>-rocm`. A GPU reaches the container only if the host's container runtime passes it in; without one the model runs on the CPU and the benchmark decides, as everywhere else. The first superadmin is created with `docker exec -it <container> CoalesceDB --create-superadmin` (§9.1). Both images' sizes go into the M11 size report. The Host and Origin checks stay on.
 
 ---
 
@@ -2683,6 +2855,9 @@ Version 2 tests (all run in CI with no model needed):
 - `test_analytics.py`: known-answer data, e.g. `y = 3x + 5 + small noise` → coefficient ≈ 3 with CI containing 3; well-separated clusters → silhouette > 0.8; collinear features → VIF warning; too few rows → refusal.
 - `test_forecasting.py`: linear series → linear trend wins and the forecast continues the line; seasonal series with 3 seasons → Holt-Winters beats naive; 8 points → refusal; random walk → "doesn't beat naive" message.
 - `test_explain.py`: `is_faithful` accepts a rephrasing that copies numbers exactly; rejects one that changes "42" to "45", adds a new percentage, or says "causes"; template explanations contain every fact.
+- Per-task models (new files; no model needed):
+  - `test_llm_client.py` (M7): `strip_think_blocks` removes one block, several blocks and a block spanning lines, in any letter case; an unclosed `<think>` removes everything after it; **a response that is only a think block becomes empty**, which `complete` reports as an empty response and `complete_json` as a failed validation that is retried; text without a think block is unchanged; a think block before a fenced SQL statement leaves exactly the SQL after `strip_code_fences`, and one before a JSON object leaves JSON that validates. Against a fake Ollama: `"think": false` is sent for a model whose `/api/show` lists the `thinking` capability and the field is absent for one that does not; `/api/show` is asked once per model; `message.thinking` never reaches `LLMCall.text`, a trace or a log; the temperature sent is the model's entry in `model_temperatures`, else `llm_temperature`, and is recorded in `LLMCall.temperature`; `task="documents"` and `task="language"` call the model chosen for that task, an explicit `model` wins, an unknown task raises, and (M15 form) a task with no active model raises `LLMUnavailable` with that task's reason and does not use another task's model.
+  - `test_task_ladders.py` (M7 for `ladder_for`, M15 for the rest): with default settings `ladder_for` returns the same ladder for the three tasks, per mode; a set `documents_ladder` changes only that task and only desktop mode, and its `_server` variant only server mode; `try_7b_first` puts the first model of that task's server ladder in front once; an empty per-task ladder is refused when settings load. With a fake Ollama: a model that is in two tasks' ladders is benchmarked once and both tasks get it; "documents" off while "sql" is on (and the reverse) leaves the other task's features on; the consent list names each missing model once and `total_download_bytes` is their sum; `prompt_tps` of the documents model decides `pdf_import_enabled`. Loaded models: two distinct models that fit together give `max_loaded_models == 2`, two that do not give 1 **and both tasks keep their model**; with no stored choice the sidecar's value is 1 and the reason says "from the next start"; with `ollama_managed` false the RAM rule adds the models together, a second model that does not fit beside the first is skipped and the task continues down its ladder, and `loaded_models_reason` says so; a third distinct model never raises the value above 2.
 - `test_no_code_execution.py`: scans `src/` and fails if it finds `exec(`, `eval(`, `pickle`, `joblib.load`, or `subprocess` outside `llm/sidecar.py`.
 
 Coverage target: ≥ 85% for `security/`, `auth/`, `db/`, `export/`, `ingest/sql_import.py`, `analytics/explain.py`.
@@ -2701,7 +2876,16 @@ python evals/run_evals.py --suite extraction  --model qwen2.5-coder:1.5b-instruc
 - **Extraction:** 3–5 self-written syllabi with labels; metrics = field-level precision/recall per table, date exact-match rate.
 - Writes `evals/results.md` with date, model, hardware and numbers. **README badges and resume bullets must only cite numbers from this file.** Comparing `1.5b` vs `7b` in the same table is a good trade-off story.
 - **Three models, one table (M10):** every suite is run for `qwen2.5-coder` 7B, 1.5B and 0.5B (all `instruct-q4_K_M`). The 7B run is required, not optional: the development machine has 16 GB of memory and the model needs about 7 GB free. These results set the 7B column of the gating table and confirm or change the order of both ladders (§6.22).
-- **Candidate check (M10):** before the ladders are final, look at the coding models currently on Ollama whose licence is Apache-2.0 or MIT and whose 4-bit file is at most about 5 GB, run the text-to-SQL and red-team suites on the plausible ones, and record them in the same table with their licence, file size and source. A candidate enters a ladder only by a spec change (§6.22), with its licence in the §1 table. Nothing is added to a ladder from a model card alone.
+- **Candidates (M10).** Evaluated alongside those three, as candidates and not as replacements:
+  - **Qwen3:** 1.7B and 0.6B for the desktop ladders, 8B for the server ladders.
+  - **The newer Qwen generation** found installed on the development Mac on 2026-10-05 (`qwen3.5:9b`; its smaller sizes, if Ollama has them, for the desktop ladders).
+  - **Other Apache-2.0 or MIT models** currently on Ollama whose 4-bit file is at most about 5.5 GB and which look plausible for one of the tasks (this widens the earlier wording "coding models": a general model can win "documents" or "language").
+
+  The same rules apply to every one of them, **before it is run** (§1): licence checked on its Ollama page (Apache-2.0 or MIT only, otherwise it is not evaluated); an explicit `-q4_K_M` tag used when one exists, otherwise the default tag with its reported quantization recorded; exact size in bytes from the registry manifest; all three written into the §1 table. For a model with the `thinking` capability, confirm on the installed Ollama that `think: false` gives an answer with no thinking text (§6.10), and record the Ollama version; if it does not, STOP and report before evaluating that model. Candidates are listed in `candidate_models` (§3); nothing is added to a ladder from a model card alone.
+- **Per task, per ladder.** Each candidate is run on each task's suite: "sql" = text-to-SQL and red-team; "documents" = extraction (and the schema-proposal cases); "language" = explanation faithfulness and chart requests. Results are reported for the desktop ladder (models that fit a desktop) and the server ladder separately, each row with: accuracy on the suite, `gen_tps` and `prompt_tps` from the §6.22 benchmark on the eval machine, median and p95 latency, the temperature used (`LLMCall.temperature`), the tag, the quantization and the Ollama version.
+- **When each task is decided.** M10 decides "sql" and "documents", for the desktop and the server ladder. The "language" suites do not exist at M10 (explanations arrive at M19, chart requests at M16), so "language" shares the sql model until **M19**, which applies the same rule to it, again for both ladders (§15).
+- **The decision rule.** Start from one shared model per ladder: the model that does best on "sql" among those that pass the speed threshold. A task gets a **different** model only if that model beats the shared model by **at least 5 percentage points on that task's own suite** and passes `benchmark_min_gen_tps` on the eval machine (in the server form of the benchmark for a server ladder). Otherwise the task shares. One shared model is simpler: one download, one model loaded, less memory, no switching (§6.22). The same 5-point bar is the one a fine-tuned model must clear (§16.6).
+- **Recording the outcome.** The ladder defaults in §3 are then set from the measured results by a spec change, shown first: the order of each ladder, and any task that gets its own ladder. Each change is logged in `docs/DECISIONS.md` with the numbers that justify it, and the model's licence row in §1 moves from "candidate" to "in a ladder".
 - **Version 2 additions:**
   - Run every suite for each model in both ladders (7B, 1.5B and 0.5B), and for stock vs fine-tuned models once §16 exists. These numbers set the feature-gating table in §6.22.
   - **Explanation faithfulness:** 30+ cases in `evals/explain/cases.jsonl` (facts from real model and forecast results). Metric = share of LLM outputs that pass `is_faithful`, plus a manual 1–5 clarity rating on 10 samples. The app is safe either way (failures fall back to the template), but a low pass rate means "Simplify wording" rarely helps.
@@ -2710,6 +2894,8 @@ python evals/run_evals.py --suite extraction  --model qwen2.5-coder:1.5b-instruc
 ### 11.3 CI — `.github/workflows/ci.yml`
 
 On push/PR: set up Python 3.12 → install `requirements-dev.txt` → `ruff check` → `pytest --cov`. `build.yml` on version tags: PyInstaller builds for `windows-latest` and `macos-latest`, uploaded as release assets.
+
+**Built in two steps.** M24 adds a minimal `ci.yml` with one job on `ubuntu-latest` (Python 3.12, `ruff check`, `pytest`), so that server mode is tested on Linux from the milestone that builds it, not only at M11: the server-mode test files of §11.1 run there with every push. M12 extends the same file (jobs for `windows-latest` and `macos-latest`, coverage) and adds `build.yml`, which from M11's decisions also builds the Linux server archive and the two server image tags on `ubuntu-latest`.
 
 ---
 
@@ -2726,7 +2912,7 @@ On push/PR: set up Python 3.12 → install `requirements-dev.txt` → `ruff chec
 
 ## 13. Out of Scope for v1
 
-OCR for scanned PDFs, writing back to or syncing with non-SQLite engines (importing from them is in scope via §6.19–6.20), cloud hosting or exposing a server to the internet, running behind a reverse proxy, single sign-on or LDAP accounts, more than one server sharing the same data (replication, failover), a web browser as a supported client, a "disconnect them" action for maintenance, opening database files over a network share, visual ER diagram editor, code signing, cloud LLM fallback, multivariate or deep-learning forecasting, causal inference, saving fitted models to disk, training on users' own data. Each is a reasonable v2 item and can be listed under "Roadmap" in the README.
+OCR for scanned PDFs, writing back to or syncing with non-SQLite engines (importing from them is in scope via §6.19–6.20), cloud hosting or exposing a server to the internet, running behind a reverse proxy, single sign-on or LDAP accounts, more than one server sharing the same data (replication, failover), a web browser as a supported client, a "disconnect them" action for maintenance, opening database files over a network share, a Linux desktop build (pywebview on GTK/Qt and per-distribution packaging need their own checks; Linux desktop users can run from source, and the Linux server build exists, §9.3), downloading GPU support on demand instead of bundling it (a smaller installer that fetches the GPU libraries on first use is possible if installer size becomes a problem; not planned now), visual ER diagram editor, code signing, cloud LLM fallback, multivariate or deep-learning forecasting, causal inference, saving fitted models to disk, training on users' own data. Each is a reasonable v2 item and can be listed under "Roadmap" in the README.
 
 ---
 
@@ -2757,24 +2943,24 @@ In this order, so the first screen answers "what is it and does it work":
 | M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. |
 | M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17). **Multi-user groundwork (both modes):** `busy_timeout_s`, `busy_retries` and `instance_lock_path` in `Settings` (§3); `DatabaseBusy` and `DatabaseInUse` (§4); busy handling in `open_connection` (§6.4) and `AppStore`; the Executor retry rules (§6.6); `db/locks.py` with `DatabaseLocks` and `acquire_instance_lock`, and the exclusive lock in registry `delete` / `rename` and in `restore` (§6.3, §6.7). These change M2/M3 code only by adding optional keywords; tests first, in new files | `test_executor.py` passes for `execute`, `execute_many`, `apply_schema` and `apply_changes` (incl. `RowConflict` rollback); destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute `test_maintenance_lock.py` passes. No existing test file is edited, and all M1-M4 tests pass unchanged. |
 | M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following docs/DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) **Also:** `mode`, `bind_host`, `allowed_hosts` and `session_idle_timeout_s` in `Settings`, with the Host and Origin checks built from them (§3, §8.6); the `sessions` table and its `AuthService` methods, idle timeout, "Log out everywhere", sessions ended on password change, reset and user deletion (§6.1, §8.1, §8.2); `Session.session_id` (§5); the presence check in delete, rename and restore (§6.3); `build_services` passing one shared `DatabaseLocks`. | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. docs/DESIGN.md followed; docs/DESIGN.md §8 checklist (all 7 items) reported `test_sessions.py` and `test_wiring.py` pass; no existing test file is edited. |
-| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel Model request queue `LLMQueue`, `LLMBusy`, `llm_parallel_server`, `llm_max_queue` (§6.10). | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported `test_llm_queue.py` passes. Works in server and client mode: two signed-in users generate SQL at the same time, the second sees its queue position. |
+| M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel Model request queue `LLMQueue`, `LLMBusy`, `llm_parallel_server`, `llm_max_queue` (§6.10). **Per-task models:** the `task` keyword on `complete` / `complete_json`, `ladder_for`, `default_model_for`, the four per-task ladder fields and `model_ladder_server` (moved here from M15), `model_temperatures` / `temperature_for`, `LLMCall.temperature`, the `think` switch and `strip_think_blocks` (§3, §5, §6.9, §6.10). | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported `test_llm_queue.py` passes. Works in server and client mode: two signed-in users generate SQL at the same time, the second sees its queue position. `test_llm_client.py` and the `ladder_for` part of `test_task_ladders.py` pass. **Check before relying on it:** what the installed Ollama answers to `think: false` for a model without the `thinking` capability (the reason the field is sent only with it, §6.10); record the Ollama version. |
 | M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
 | M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. Works in server and client mode. |
-| M10 | Evals harness + first `results.md` (§11.2) | Numbers recorded for 7B, 1.5B and 0.5B (the 7B run is required; the development Mac has 16 GB). Candidate check of Apache-2.0/MIT coding models on Ollama recorded with licences; ladder order confirmed or changed by a spec change (§11.2, §6.22). Licence of every ladder model checked on its Ollama page and the §1 table updated. |
-| M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3). Before building, generate a full lock file pinning every package, transitive dependencies included. **Server and client packaging:** the `--server` flag and `--create-superadmin`, which passes on to `coalescedb.admin_cli` built at M24 (§9.1); setup for running the server as a service that starts with the machine (systemd unit, launchd plist, Windows service); the desktop build is also the client build. | Built app starts on a clean machine, downloads the model on first run after consent, works offline after Server mode: the service starts at boot on a clean machine, a client on a second machine connects through a saved server, and a restart of the service signs everyone out. **Decide at M11, with approval:** how the Windows service is registered (a wrapper such as NSSM or `pywin32` would be a new dependency; `subprocess` stays banned outside `llm/sidecar.py`). |
-| M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 README has the "Running a server" section (§14 item 7b). |
+| M10 | Evals harness + first `results.md` (§11.2) `candidate_models` (§3). Per-task evaluation of the six named candidates (`qwen2.5-coder` 7B, 1.5B, 0.5B; Qwen3 8B, 1.7B, 0.6B), the newer Qwen generation and any other Apache-2.0/MIT candidate (§11.2). | Numbers recorded for 7B, 1.5B and 0.5B (the 7B run is required; the development Mac has 16 GB). Candidate check of Apache-2.0/MIT coding models on Ollama recorded with licences; ladder order confirmed or changed by a spec change (§11.2, §6.22). Licence of every ladder model checked on its Ollama page and the §1 table updated. **Per-task round:** before any candidate is run, its licence, pinned tag (explicit `-q4_K_M` when it exists, else the default tag's quantization) and exact size are in the §1 table, and `think: false` is confirmed silent for thinking models on the installed Ollama (version recorded; STOP if it is not). Results per task, for the desktop and the server ladder, with accuracy, speed and temperature. **"sql" and "documents" are decided here** by the 5-point rule; "language" stays on the sql model until M19. Ladder defaults in §3 set from the results by a spec change shown first, each logged in docs/DECISIONS.md. The fine-tuning base for M20 is named. |
+| M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3). Before building, generate a full lock file pinning every package, transitive dependencies included. **Server and client packaging:** the `--server` flag and `--create-superadmin`, which passes on to `coalescedb.admin_cli` built at M24 (§9.1); setup for running the server as a service that starts with the machine (systemd unit, launchd plist, Windows service); the desktop build is also the client build. **GPU bundling and Linux:** Ollama bundled with CUDA and ROCm on Windows, CUDA on the Linux server build with ROCm as a separate variant, the standard binary on macOS (§9.2); the Linux server build with its systemd unit (§9.3); the server Docker image with CUDA and ROCm tags (§9.4); `COALESCEDB_OLLAMA_MANAGED` and the sidecar's `OLLAMA_MAX_LOADED_MODELS` (§9.1, §9.2). | Built app starts on a clean machine, downloads the model on first run after consent, works offline after Server mode: the service starts at boot on a clean machine, a client on a second machine connects through a saved server, and a restart of the service signs everyone out. **Decide at M11, with approval:** how the Windows service is registered (a wrapper such as NSSM or `pywin32` would be a new dependency; `subprocess` stays banned outside `llm/sidecar.py`). **Before building:** the redistribution terms of the GPU libraries in the Ollama archives are read and recorded, with the licence texts they require in the bundle (STOP if a library may not be redistributed); the GPUs the shipped Ollama version supports are listed for the README. **After building:** `packaging/SIZES.md` records, per platform and variant, the app's size unpacked and compressed, its five largest packages, and the bundled Ollama with GPU libraries separately (Linux CUDA and ROCm variants and both image tags included). On a machine with no usable GPU the app starts, the benchmark runs on the CPU and picks a model or disables AI. The Linux server build starts under systemd and serves a client. |
+| M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 README has the "Running a server" section (§14 item 7b). `ci.yml` (started at M24) extended to Windows and macOS with coverage; `build.yml` also builds the Linux server archive and the server image tags (§11.3). README lists the supported GPUs and the download sizes from `packaging/SIZES.md`. |
 | M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
 | M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
-| M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating `model_ladder_server`, `ladder_for`, the 7B entry and exact sizes in `KNOWN_MODEL_SIZES`, `CONTEXT_BYTES_PER_SLOT`, the parallel clock-based benchmark, `app_settings` with `desktop_try_7b`, superadmin-only download and benchmark in server mode (§3, §6.22). | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Server mode: the benchmark runs 3 requests at once and the clock-based rule decides. **Measure and record** the memory per extra parallel slot for each model and replace the provisional `CONTEXT_BYTES_PER_SLOT` values (spec change, shown first). Works in server and client mode. |
-| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
+| M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating The server ladder walked by the benchmark (`model_ladder_server` and `ladder_for` themselves arrive at M7), the 7B entry and exact sizes in `KNOWN_MODEL_SIZES`, `CONTEXT_BYTES_PER_SLOT`, the parallel clock-based benchmark, `app_settings` with `desktop_try_7b`, superadmin-only download and benchmark in server mode (§3, §6.22). **Per task:** `AIStatus.active_models`, `task_reasons`, `max_loaded_models`, `loaded_models_reason` (§5); the ladder walked per task with each distinct model benchmarked once; the consent list with its total; the loaded-models rule and the summed RAM rule for an Ollama the app does not manage; `model_switch_notice_s` and the "Loading model" text; gating by task (§6.22). | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Server mode: the benchmark runs 3 requests at once and the clock-based rule decides. **Measure and record** the memory per extra parallel slot for each model and replace the provisional `CONTEXT_BYTES_PER_SLOT` values (spec change, shown first). Works in server and client mode. The rest of `test_task_ladders.py` passes. **Measure and record** the switch delay between each pair of ladder models and confirm or change `model_switch_notice_s`; with the default settings (one shared model) behaviour is identical to the single-model form. |
+| M16 | Frames & charts (§6.23), Analyze page Chart tab, Quick chart | `test_charts.py` passes; PNG/SVG/PDF exports match the on-screen chart. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. "Describe chart" calls the model with `task="language"` (§6.10). |
 | M17 | Profiling, correlation, modeling (§6.24), Summary/Relationships/Model tabs Analytics job cap and queue (§6.24). | `test_analytics.py` and `test_no_code_execution.py` pass; a 200k-row regression finishes or times out cleanly without freezing the UI. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported `test_analysis_queue.py` passes. Works in server and client mode. |
 | M18 | Forecasting (§6.25), Forecast tab | `test_forecasting.py` passes; intervals shown; naive-baseline comparison visible. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
-| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md`. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
-| M20 | Fine-tuning track (§16), separate from app code; can start once M10 evals exist | Fine-tuned model beats stock by the margin in §16.6, or the stock model stays default and the result is documented anyway |
+| M19 | Explanations (§6.26), column units editor, report PDF, explanation evals | `test_explain.py` passes; faithfulness eval recorded in `evals/results.md`. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. **The "language" ladder is decided here:** with the explanation-faithfulness and chart-request suites now existing, every candidate from M10 is run on them, for the desktop and the server ladder; "language" gets its own model only by the 5-point rule of §11.2 (and passing the speed threshold), otherwise it keeps sharing the sql model. The outcome is a spec change shown first and is logged in docs/DECISIONS.md. |
+| M20 | Fine-tuning track (§16), separate from app code; can start once M10 evals exist Base model as chosen after M10. Compares the three packaging options of §16.5 with the §11.2 evals per task: (a) one combined fine-tune, (b) two LoRA adapters through `ADAPTER`, (c) two merged models; `finetuned_models` (§3) and adapter registration in `model_store` only if (b) or (c) ships. | Fine-tuned model beats stock by the margin in §16.6, or the stock model stays default and the result is documented anyway The four checks of §16.5 for option (b) are run on the installed Ollama and their results recorded before (b) is built; if one fails, (b) is dropped and that is written down. No PyTorch, `transformers` or `peft` in the app or its build. Ship criteria applied per task (§16.6). |
 | M21 | *(Optional)* Live database import (§6.20) | Imports from a local PostgreSQL in Docker; a password canary never appears on disk; source DB unchanged (row counts match and a write attempt fails) Works in server and client mode (the import runs on the server). |
 | M22 | Query builder (§6.27), Build query mode as the Query page default, Show SQL panel (§8.3). **Built right after M6** | `test_query_builder.py` passes; with AI off, a viewer answers a filtered, grouped question across two linked tables without typing SQL; the sqlglot round-trip check in §6.27 holds. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
 | M23 | Data editor (§6.28, §8.8) and table designer (§6.29, §8.9). **Built after M9** (needs `compile_ddl`) | `test_data_editor.py` and `test_table_designer.py` pass; with AI off, an admin creates a table, adds a column, edits and deletes rows and drops the table by clicking only; a viewer sees the grid read-only; a conflicting edit is reported, not overwritten; the sqlglot checks in §6.28 and §6.29 hold. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
-| M24 | **Server and client mode. Built right after M22.** Server mode in `ui/main.py` and `ui/server.py` (§8.6 items 10-17): HTTPS with the administrator's certificate, `Secure` cookie, HSTS, `proxy_headers=False`, no `/setup` page, `/coalescedb/info`, no quit action, per-user reduced transparency; `tls_cert_path`, `tls_key_path`, the login-limit fields, `servers_path` and the mode rules in `Settings` (§3); `TooManyAttempts`, the per-address login limit and the per-account slow-down, `audit_log.client_addr` with its migration, `Session.client_addr` (§4, §5, §6.1); the first-superadmin terminal command as a module entry point (`coalescedb/admin_cli.py`, §9.1); the start screen, saved servers, connection test and the locked-down client window (§8.10, `client/profiles.py`, `ui/start_page.py`); the Admin page's Address column (§8.5). Tests first, in new files | `test_server_mode.py`, `test_client_window_scan.py`, `test_admin_cli.py`, `test_login_rate_limit.py` and `test_server_profiles.py` pass; no existing test file is edited and every earlier test passes unchanged. Manual, on two machines in one network: the server starts only with a certificate; the first superadmin is created with the terminal command and `/setup` answers 404; a client adds the server, signs in as a viewer and runs a query; a wrong-name certificate is refused with the app's message; five wrong passwords from one machine block that machine and not the account; a superadmin on a second client cannot delete a database the first has open; the audit log shows both addresses. Port and offline checks per mode (desktop: 127.0.0.1 only; server: only the configured address and port, HTTPS only, no outgoing connection). **Check before relying on it, and STOP and report if any fails:** (1) `https_only` in `session_middleware_kwargs` sets the `Secure` flag in the pinned NiceGUI; (2) `proxy_headers=False` reaches uvicorn through `ui.run` and `X-Forwarded-For` is ignored; (3) `ssl_certfile` / `ssl_keyfile` work through `ui.run` in the pinned version; (4) NiceGUI's native window is created without a `js_api`, and the window can be sent to an external https address; (5) navigation lock, on Windows and macOS: whether the pinned pywebview can refuse a navigation to another origin before it happens. If it cannot, use the fallback of §8.10 (send the window back to the server's origin when it has landed anywhere else) and report which one was built. The no-bridge rule (4) is the security boundary, so STOP and ask only if neither refusing nor sending back is possible; (6) **trust stores:** on macOS Python's `ssl` usually does NOT use the Keychain, while the webview does, so "Test connection" would reject a company certificate that the window accepts. Expected solution: the `truststore` package (PyPA, MIT), which makes Python use the operating system's trust store. It is a new dependency: **ask for approval at M24; it is not added before**. Check Windows as well; (7) whether pywebview's native window menu can offer "Switch server…"; if not, the close-and-reopen limit in §8.10 stands; (8) exports download through the client window. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported |
+| M24 | **Server and client mode. Built right after M22.** Server mode in `ui/main.py` and `ui/server.py` (§8.6 items 10-17): HTTPS with the administrator's certificate, `Secure` cookie, HSTS, `proxy_headers=False`, no `/setup` page, `/coalescedb/info`, no quit action, per-user reduced transparency; `tls_cert_path`, `tls_key_path`, the login-limit fields, `servers_path` and the mode rules in `Settings` (§3); `TooManyAttempts`, the per-address login limit and the per-account slow-down, `audit_log.client_addr` with its migration, `Session.client_addr` (§4, §5, §6.1); the first-superadmin terminal command as a module entry point (`coalescedb/admin_cli.py`, §9.1); the start screen, saved servers, connection test and the locked-down client window (§8.10, `client/profiles.py`, `ui/start_page.py`); the Admin page's Address column (§8.5). Tests first, in new files A minimal `.github/workflows/ci.yml` with one `ubuntu-latest` job (`ruff check`, `pytest`), so server mode is tested on Linux from here on (§11.3). | `test_server_mode.py`, `test_client_window_scan.py`, `test_admin_cli.py`, `test_login_rate_limit.py` and `test_server_profiles.py` pass; no existing test file is edited and every earlier test passes unchanged. Manual, on two machines in one network: the server starts only with a certificate; the first superadmin is created with the terminal command and `/setup` answers 404; a client adds the server, signs in as a viewer and runs a query; a wrong-name certificate is refused with the app's message; five wrong passwords from one machine block that machine and not the account; a superadmin on a second client cannot delete a database the first has open; the audit log shows both addresses. Port and offline checks per mode (desktop: 127.0.0.1 only; server: only the configured address and port, HTTPS only, no outgoing connection). **Check before relying on it, and STOP and report if any fails:** (1) `https_only` in `session_middleware_kwargs` sets the `Secure` flag in the pinned NiceGUI; (2) `proxy_headers=False` reaches uvicorn through `ui.run` and `X-Forwarded-For` is ignored; (3) `ssl_certfile` / `ssl_keyfile` work through `ui.run` in the pinned version; (4) NiceGUI's native window is created without a `js_api`, and the window can be sent to an external https address; (5) navigation lock, on Windows and macOS: whether the pinned pywebview can refuse a navigation to another origin before it happens. If it cannot, use the fallback of §8.10 (send the window back to the server's origin when it has landed anywhere else) and report which one was built. The no-bridge rule (4) is the security boundary, so STOP and ask only if neither refusing nor sending back is possible; (6) **trust stores:** on macOS Python's `ssl` usually does NOT use the Keychain, while the webview does, so "Test connection" would reject a company certificate that the window accepts. Expected solution: the `truststore` package (PyPA, MIT), which makes Python use the operating system's trust store. It is a new dependency: **ask for approval at M24; it is not added before**. Check Windows as well; (7) whether pywebview's native window menu can offer "Switch server…"; if not, the close-and-reopen limit in §8.10 stands; (8) exports download through the client window. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported The Linux CI job is green, including the server-mode test files. |
 
 **Server and client mode from M24 on.** M24 is built before M7, so every milestone after it is built into an app that already has both modes. From then on a milestone is done only when its feature also works with the server running on one machine and the desktop app connected as a client: the rows above say "Works in server and client mode", which means the feature's manual check is repeated through a client, with two users signed in at once where the feature can be used by two people. M20 (training) has no such check.
 
@@ -2789,7 +2975,7 @@ In this order, so the first screen answers "what is it and does it work":
 ## 16. Model Fine-Tuning & Quantization (optional track)
 
 ### 16.1 What this is, and isn't
-This is **fine-tuning**: continuing to train an existing model on a few thousand task examples so it fits this app's exact prompts. **Pretraining** (training a language model from scratch) needs billions of tokens and large GPU clusters and is not part of this project. The base models are `Qwen/Qwen2.5-Coder-1.5B-Instruct` and `Qwen/Qwen2.5-Coder-0.5B-Instruct` (Apache-2.0). Both are run **quantized** (Q4_K_M by default), which is what makes them small and fast enough for ordinary laptops.
+This is **fine-tuning**: continuing to train an existing model on a few thousand task examples so it fits this app's exact prompts. **Pretraining** (training a language model from scratch) needs billions of tokens and large GPU clusters and is not part of this project. The base models are currently `Qwen/Qwen2.5-Coder-1.5B-Instruct` and `Qwen/Qwen2.5-Coder-0.5B-Instruct` (Apache-2.0). **The base is chosen after the M10 evals** (§11.2): it is the model that ends up first in the desktop "sql" ladder, so if a candidate replaces the 1.5B there, it becomes the fine-tuning base, under the same licence rule (§1). Both are run **quantized** (Q4_K_M by default), which is what makes them small and fast enough for ordinary laptops.
 
 The fine-tuned model ships **only if it measurably beats the stock model** (§16.6). Either outcome is worth writing up.
 
@@ -2801,6 +2987,8 @@ Every example uses the **exact** prompt text from §7, generated by importing `c
 | ~60% | Text-to-SQL (§7.1), both role variants | Public text-to-SQL datasets converted to SQLite (e.g. Spider, BIRD). **Check each dataset's license and record it in `MODEL_CARD.md`**; several popular ones are CC BY-SA, which requires attribution. Plus questions written against the app's own templates. Include unanswerable questions mapped to `-- CANNOT_ANSWER`, and injection-style questions ("ignore your rules and…") mapped to the correct harmless SELECT or `-- CANNOT_ANSWER`. |
 | ~30% | Row extraction (§7.3) | **Synthetic, labelled by construction:** generate the structured record first (course, dates, weights), then render it into document text with varied layouts and wording. The label is correct because the document was made from it. Include documents with embedded injection text whose correct output ignores it. |
 | ~10% | Schema proposal (§7.2) and explanation rewriting (§7.4) | Hand-written and synthetic examples; explanation targets must pass `is_faithful`. |
+
+These shares are for one combined fine-tune (§16.5 option a). If a separate documents model or adapter is adopted (options b, c), the SQL dataset drops the extraction share and is almost entirely text-to-SQL, and the documents dataset holds the extraction and schema-proposal examples.
 
 Rules:
 - `validate_dataset.py` executes every SQL label against its schema in SQLite and drops failures, and validates every JSON label against its Pydantic model.
@@ -2822,6 +3010,28 @@ Rules:
 4. Re-run the full §11.2 evals **on the quantized GGUF through Ollama**, not on the training-time model; that is what users get.
 
 ### 16.5 Modelfile & distribution
+
+**Three ways to ship the fine-tune (compared at M20).** Each is built as far as its checks allow, run through the §11.2 evals per task on the quantized result in Ollama, and compared in `evals/results.md`:
+
+| | Option | What ships | Cost |
+|---|---|---|---|
+| (a) | One combined fine-tune covering SQL and extraction (the plan so far, §16.2 shares) | One model, used by every task | One download, one model loaded |
+| (b) | Two LoRA adapters, "sql" and "documents", on the same base | Two Ollama models made from the same base file plus one small adapter each (Modelfile `ADAPTER` instruction); the base file is stored once on disk | Small downloads. Memory and switching cost when tasks alternate: to be measured |
+| (c) | Two separately merged models | Two full models | Two downloads, and the two-model memory and switching rules of §6.22 |
+
+**Checks before building (b), on the installed Ollama version. If one fails, say so and drop (b); do not work around it.**
+
+1. **Does `ADAPTER` support this base?** Found on 2026-10-05 in Ollama's own documentation at tag v0.33.2 (`docs/modelfile.mdx`, `docs/import.mdx`): Safetensors adapters are listed as supported only for Llama, Mistral and Gemma. **Qwen2 is not in that list.** GGUF adapters are accepted (`ADAPTER ./adapter.gguf`, made with llama.cpp's `convert_lora_to_gguf.py`), with no list of architectures. So the only route that may work is a GGUF adapter, and whether it works for the Qwen2 architecture is not documented: test it.
+2. **Does a QLoRA adapter on the Q4_K_M base keep its eval score?** The same documentation advises against it ("it's best to use non-quantized (i.e. non-QLoRA) adapters", because frameworks quantize differently) and warns of "erratic" behaviour when the base differs from the one the adapter was trained on. Measure the adapter on the runtime base against the same fine-tune merged and quantized (option a or c); a drop is a reason to drop (b).
+3. **Can the app register it?** The app creates models through `POST /api/create` with structured fields, not a Modelfile (§6.22). Whether that request accepts an adapter, and in what shape, was not verified: check it against the installed Ollama's API documentation.
+4. **Memory and switching cost** when the two adapter models alternate: does Ollama share the base in memory or load it twice, and how long does a switch take (§6.22)?
+
+Rules that hold for every option:
+
+- **An adapter is trained on the exact base model used at runtime:** the Instruct variant, the same revision. An adapter from another base is never shipped.
+- **The app never loads PyTorch, `transformers` or `peft`.** All inference stays in Ollama. Those libraries live only in `training/` (`requirements-train.txt`) and are excluded from the build (§9.3).
+- **If a separate documents model or adapter is adopted** (b or c), the SQL fine-tune's dataset drops its row-extraction share and concentrates on text-to-SQL; the documents one takes the extraction and schema-proposal examples (§16.2).
+- `model_store` registers whichever option ships, and each task's ladder names its model (§6.22, §3 `finetuned_ladder` / `finetuned_models`).
 The Modelfile below is for testing the model by hand (`ollama create coalescedb-sql:1.5b -f training/Modelfile.1_5b`). The app itself registers the model through the API with the same template and parameters (§6.22 `ensure_model`), so copy the template text into `ModelArtifact.template` too.
 ```
 FROM ./coalescedb-sql-1.5b-Q4_K_M.gguf
@@ -2832,6 +3042,8 @@ PARAMETER num_ctx 8192
 No `SYSTEM` prompt is baked into the Modelfile: `llm/prompts.py` stays the single source of truth. GGUF files are published as release assets (GitHub Releases or Hugging Face), with SHA-256 and size pinned in `model_store.py` (§6.22). If the download fails, the app falls back to stock models.
 
 ### 16.6 Ship criteria (recorded in `MODEL_CARD.md` and `evals/results.md`)
+The criteria are applied per task to whichever option of §16.5 is being judged: a fine-tune for a task must gain at least 5 percentage points on **that task's** suite (text-to-SQL accuracy for "sql", extraction field-level F1 for "documents") with no regression on the others it would be used for. For the combined model (a) that is the list below, unchanged.
+
 The fine-tuned model replaces the stock one in `model_ladder` only if, on the quantized GGUF:
 - Text-to-SQL execution accuracy is at least **5 percentage points** higher than stock;
 - Extraction field-level F1 is not lower than stock, and the invalid-JSON rate is not higher;
