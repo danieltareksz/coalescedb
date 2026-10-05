@@ -49,8 +49,10 @@ _WRITE_NODES = (
     exp.Command,
 )
 
+# Reserved as the start of a table, index or view name, and of a function name.
 _RESERVED_PREFIXES = ("sqlite_", "pragma_", "_app_")
-_RESERVED_FUNCTION_PREFIXES = ("sqlite_", "pragma_")
+# The only forms of IN the guard accepts: a bracketed list or a bracketed subquery.
+_IN_ALLOWED_ARGS = frozenset({"this", "expressions", "query"})
 # Reserved as a whole name, as a table or as a function call. dbstat lists every table's
 # pages and sizes, and the authorizer does not refuse it, so the guard is its only layer.
 _RESERVED_NAMES = frozenset({"dbstat"})
@@ -104,11 +106,21 @@ def _validate_parsed(sql: str, role: Role, known_tables: set[str]) -> GuardResul
     for node in root.walk():
         if kind is StatementKind.SELECT and isinstance(node, _WRITE_NODES):
             return _reject("A SELECT query cannot contain a statement that changes data.", kind)
+        if isinstance(node, exp.In) and any(
+            value and key not in _IN_ALLOWED_ARGS for key, value in node.args.items()
+        ):
+            # SQLite reads `x IN tbl` as `x IN (SELECT * FROM tbl)`, but sqlglot parses the
+            # name as a column, so the name checks below would never see that table.
+            return _reject(
+                "IN must be followed by a list or a query in brackets, "
+                "for example IN (SELECT ... FROM a_table).",
+                kind,
+            )
         if isinstance(node, exp.Func):
             for name in _function_names(node):
                 if name in FORBIDDEN_FUNCTIONS:
                     return _reject(f'The function "{name}" is not allowed.', kind)
-                if name.startswith(_RESERVED_FUNCTION_PREFIXES) or name in _RESERVED_NAMES:
+                if name.startswith(_RESERVED_PREFIXES) or name in _RESERVED_NAMES:
                     return _reject(f'The function "{name}" is not allowed.', kind)
         elif isinstance(node, exp.Table):
             # A schema prefix must be absent or "main". "temp." would create or reach a
