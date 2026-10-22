@@ -1089,7 +1089,7 @@ Requirements:
   - **Known limit — rename targets:** for `ALTER TABLE t RENAME TO _app_x`, SQLite only ever tells the authorizer the *old* name (`t`); the new name is never passed to it (checked on SQLite 3.53.1). The authorizer therefore cannot refuse a rename by its target. That statement is covered by the guard instead: step 7 of §6.2 (built in M4) rejects any reference to an `_app_` name, and `test_sql_guard.py` has a row for `ALTER TABLE t RENAME TO _app_x` (§11.1). The case is not part of `test_authorizer.py` (M3).
   - A statement the authorizer denies raises `sqlite3.DatabaseError` ("not authorized") from the connection. Turning that into the app's `ExecutionError` is the Executor's job (§6.6).
   - **Do not deny writes to `sqlite_*` tables for admins.** SQLite reports every `CREATE`, `DROP` and `ALTER` as a write to `sqlite_master`, so that rule blocks all schema changes. Direct tampering (`UPDATE sqlite_master`, `PRAGMA writable_schema`) is already stopped by guard step 7 and the PRAGMA deny. `test_authorizer.py` must confirm that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` succeed for admins.
-  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. The internal connection has a fixed timeout of 30 s (it has no `timeout_s` argument); this mainly bounds `integrity_check` on a large import. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
+  - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. The internal connection has a fixed timeout of 30 s (it has no `timeout_s` argument); this mainly bounds `integrity_check` on a large import. **From M5:** `open_internal_connection(path, *, busy_timeout_s: float | None = None)`. `None` keeps the M3 behaviour (the 30 s doubles as SQLite's lock wait), so `import_file` and introspection callers are unchanged. With a value, SQLite waits that long for another connection's lock. Either way, a busy error (the busy test above) becomes `DatabaseBusy` with the same message as `open_connection`, while opening and when it leaves the `with` block; the 30 s running limit stays. The Executor reaches it through `object_names(path, busy_timeout_s=settings.busy_timeout_s)` (§6.5), so a table-name read on a locked file gives up after `busy_timeout_s`, not after 30 s. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
 - **Busy database (added at M5):** two different waits exist and are kept apart. `timeout_s` is how long a statement may *run* (the progress handler below). `busy_timeout_s` is how long SQLite *waits for another connection's lock* before giving up (`sqlite3.connect(..., timeout=busy_timeout_s)`). When that wait runs out, SQLite raises `sqlite3.OperationalError` with `sqlite_errorcode` `SQLITE_BUSY` (or `SQLITE_LOCKED`); `open_connection` turns exactly those into `DatabaseBusy`, with the message "Database busy. Another change is being saved. Try again in a moment." Any other `OperationalError` is left for the Executor (§6.6). **The busy test:** `getattr(exc, "sqlite_errorcode", None)`, masked with `& 0xFF`, is `sqlite3.SQLITE_BUSY` or `sqlite3.SQLITE_LOCKED`. Python reports extended codes (for example `SQLITE_BUSY_TIMEOUT`), and an `OperationalError` not raised by SQLite has no `sqlite_errorcode` at all, which counts as not busy. The translation covers the PRAGMAs run while opening (`PRAGMA journal_mode = WAL` can itself be busy) and any error that leaves the `with` block. An error caught inside the block is not translated: that is how the Executor sees the raw busy error of `BEGIN IMMEDIATE` and retries it (§6.6). In WAL mode readers never wait for a writer, so this mostly concerns two writes at the same moment; an imported file that no admin connection has opened yet is still in rollback-journal mode, where a write also makes readers wait.
 - **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`. `timeout_s` limits how long statements *run*; for writes the clock restarts when `BEGIN IMMEDIATE` succeeds (`restart_deadline()`, above), so the busy wait and its retries are never charged to it. Both the progress handler and the `QueryTimeout` translation read the connection's **current** deadline (the restarted one), never a value captured when the connection was opened; otherwise a restarted statement would still be interrupted, or its interruption not recognised as a timeout (checked on SQLite 3.53.1: without the restart, a write that waited for the lock was interrupted 1 ms after `BEGIN IMMEDIATE`).
 
@@ -1099,11 +1099,12 @@ Requirements:
 def list_tables(path: Path) -> list[TableInfo]: ...
     # Excludes sqlite_* and _app_* tables. Tables only, not views. A foreign key that names
     # no target column is resolved to the referenced table's primary key.
-def object_names(path: Path) -> set[str]: ...
+def object_names(path: Path, *, busy_timeout_s: float | None = None) -> set[str]: ...
     # Added at M5. Names of the tables AND views in sqlite_master, skipping sqlite_* and
     # _app_* names. No row counts, so it is cheap enough to run before every statement:
     # the Executor passes it to the guard as known_tables (§6.6). Uses the internal
-    # read-only connection (§6.4).
+    # read-only connection (§6.4), passing busy_timeout_s on; None keeps its 30 s wait.
+    # A locked file raises DatabaseBusy. The Executor always passes settings.busy_timeout_s.
 def schema_ddl(path: Path, *, max_chars: int = 6000) -> str: ...
     # For prompts. Each table's CREATE statement from sqlite_master, followed by a comment
     # with its row count (e.g. "-- 150 rows"). The project has no tokenizer, so the budget
@@ -1207,7 +1208,11 @@ class Executor:
         # so self-correction reports it to the model like any other error.
 ```
 
-**Order of the steps.** Every method above except `preview` and `dry_run` follows the numbered contract below. `session.db_name` is `None` → `PermissionDenied`, before step 1. `locks.shared(session.db_name)` is taken **right after step 1** and held until the method returns, so the table names read for step 2 (`introspect.object_names`, §6.5) and everything after it happen under the lock.
+**Order of the steps.** Every method above except `preview` and `dry_run` follows the numbered contract below. `session.db_name` is `None` → `PermissionDenied`, before step 1. `locks.shared(session.db_name)` is taken **right after step 1** and held until the method returns, so the table names read for step 2 (`introspect.object_names(path, busy_timeout_s=settings.busy_timeout_s)`, §6.5) and everything after it happen under the lock. A busy table-name read raises `DatabaseBusy` and is never retried, like a SELECT.
+
+**`preview` and the role.** `preview` resolves the role exactly as step 1 does (`auth.role_for`, never `session.role`) and runs the guard with it. No database selected or no role → `PermissionDenied`. It writes no audit entry, also when it refuses.
+
+**How the Executor reaches SQLite (fixed by the tests).** `executor.py` imports `open_connection` (from `db/connection.py`) and `validate` (from `security/sql_guard.py`) at module level and calls them by those names; the tests replace `coalescedb.db.executor.open_connection` and `coalescedb.db.executor.validate` to simulate a busy `COMMIT` and a broken guard. Each call uses the **one** connection yielded by `open_connection`, and transactions are issued as SQL on it: `BEGIN IMMEDIATE`, `COMMIT` and `ROLLBACK` through `execute`, never `conn.commit()` / `conn.rollback()` and never a second connection.
 
 Contract for `execute`, `execute_many`, `apply_schema` and `apply_changes`:
 
@@ -1226,6 +1231,19 @@ Contract for `execute`, `execute_many`, `apply_schema` and `apply_changes`:
 - **Failed after it started** (`ExecutionError`, `QueryTimeout`, `RowConflict`) → `query_failed`, with the error's class name (and `statement_index` for `RowConflict`). Never SQLite's message text.
 - **Busy** → `query_busy` (see below).
 - **The audit write itself fails after a write has committed** (for example `app.db` is busy): the Executor never reports a committed write as not done, because the user would try again and run it twice. It writes an `audit_failed` trace line (§6.17) and raises `ExecutionError("The change was saved, but it could not be recorded in the audit log. Tell your administrator.")`.
+
+**Audit `detail` keys (fixed by the tests).** `source`, `user_id` and `db_name` are the entry's own columns, not `detail` keys. No key ever holds a parameter value, a result row or SQLite's message text.
+
+| Action | From | `detail` keys |
+|---|---|---|
+| `query`, `export`, `ingest`, `sql_import`, `live_import` | `execute`, `execute_many` | `sql` (the `normalized_sql` that ran), `kind` (`StatementKind` value), `row_count`, `elapsed_ms` |
+| same | `apply_schema` | `sql` (list of the statements that ran), `counts` (statements per kind, e.g. `{"create_table": 1}`), `elapsed_ms` |
+| same | `apply_changes` | `counts` (statements per kind, e.g. `{"update": 1, "insert": 1}`), `tables` (sorted names from `tables_touched`, display only), `row_count`, `elapsed_ms`; no SQL |
+| `query_rejected` | any | `reasons` (list), `sql` (cut to `max_sql_chars`), `sql_length`; for `apply_schema` / `apply_changes`, `sql` and `sql_length` are lists, one item per statement |
+| `query_failed` | any | `error` (class name only), `sql` and `kind` as for success when known, `statement_index` for `RowConflict` |
+| `query_busy` | any | `sql` (a list for `apply_schema` / `apply_changes`), `busy_retries_used` (always, 0 included); no `row_count` |
+
+Every success entry also has `busy_retries_used` when it is not 0 (see the retry rules below).
 
 **Maintenance lock.** Every method above, `preview` and `dry_run` included, runs inside `locks.shared(session.db_name)` from right after step 1 (see "Order of the steps"), so the table-name read, the snapshot and the statement are all covered. If the database is being deleted, renamed or restored it raises `DatabaseBusy` and nothing runs (§6.3).
 
