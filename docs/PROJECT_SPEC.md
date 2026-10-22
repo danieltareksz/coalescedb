@@ -189,14 +189,20 @@ coalescedb/
 │   │   ├── test_client_window_scan.py  # Source scan: js_api, .expose(, IGNORE_SSL_ERRORS (§11.1, M24)
 │   │   ├── test_admin_cli.py     # First-superadmin terminal command (§11.1, M24)
 │   │   ├── test_login_rate_limit.py  # Per-address limit, per-account slow-down (§11.1, M24)
-│   │   └── test_server_profiles.py   # Saved-server validation; no password on disk (§11.1, M24)
+│   │   ├── test_server_profiles.py   # Saved-server validation; no password on disk (§11.1, M24)
+│   │   └── test_executor_canary.py   # Canaries never in audit/traces; layers hold with guard bypassed; offline (§11.1, M5)
 │   ├── test_auth.py
 │   ├── test_config.py
 │   ├── test_registry.py          # Create / delete / rename / import lifecycle (§6.3)
 │   ├── test_backup.py            # Snapshot + pruning (§6.7)
 │   ├── test_introspect.py
+│   ├── test_config_m5.py         # busy_timeout_s, busy_retries, instance_lock_path (§3, M5)
+│   ├── test_tracing.py           # configure_tracing, trace, recent (§6.17, M5)
 │   ├── test_executor.py
-│   ├── test_maintenance_lock.py  # DatabaseLocks, in-use refusal, busy handling (§11.1, M5)
+│   ├── test_executor_busy.py     # Busy handling and BEGIN IMMEDIATE retries (§6.4, §6.6, M5)
+│   ├── test_maintenance_lock.py  # DatabaseLocks, exclusive lock, instance lock (§11.1, M5)
+│   ├── test_backup_restore.py    # BackupService list / restore (§6.7, M5)
+│   ├── test_appstore_busy.py     # AppStore busy_timeout_s (§6.1, M5)
 │   ├── test_wiring.py            # build_services shares one DatabaseLocks (§11.1, M6)
 │   ├── test_query_builder.py     # §6.27
 │   ├── test_data_editor.py       # §6.28
@@ -276,7 +282,13 @@ class Settings:
     traces_path: Path              # data_dir / "traces.jsonl"
     ui_secret_path: Path           # data_dir / "ui_secret"   (NiceGUI storage_secret, §8.6). Added at M6
     ui_storage_dir: Path           # data_dir / "ui_storage"  (NiceGUI's own storage files, §8.6). Added at M6
-    instance_lock_path: Path       # data_dir / "instance.lock" (one process per data folder, §6.3). Added at M5
+    instance_lock_path: Path | None = None
+                                   # data_dir / "instance.lock" (one process per data folder, §6.3). Added at M5.
+                                   # Declared with a None default so Settings(...) built by hand without it
+                                   # (test_config.py) still works; load_settings always sets it, and
+                                   # acquire_instance_lock raises ValueError if it is None. The M6 and M24
+                                   # path fields above and below (ui_secret_path, ui_storage_dir, servers_path)
+                                   # get the same treatment when they are added.
     servers_path: Path             # data_dir / "servers.json" (saved servers on a client machine, §8.10). Added at M24
 
     # How the app runs (§0.6, §8.6). Every field below that is not in the code yet is added
@@ -431,7 +443,8 @@ def load_settings() -> Settings: ...
     # (databases_dir, backups_dir, app_db_path, traces_path, benchmark_cache_path, from
     # M5 instance_lock_path, from M6 ui_secret_path and ui_storage_dir, and from M24
     # servers_path) always
-    # follow it and cannot be overridden one by one.
+    # follow it and cannot be overridden one by one. A derived path field that has a None
+    # default (instance_lock_path, §3 above) is still never read from the environment.
     # A value that can't be converted to the field's type raises ValueError naming the
     # variable (never repeating the value). An empty model_ladder raises ValueError.
     #
@@ -477,12 +490,19 @@ class QueryTimeout(CoalesceDBError): ...
 class ExecutionError(CoalesceDBError): ...            # Wraps sqlite3.Error; .sqlite_message
 class RowConflict(CoalesceDBError): ...               # apply_changes (§6.6): a row was changed or removed
                                                       # after it was loaded; .statement_index: int. Added at M5
+                                                      # RowConflict(user_message=None, *, statement_index: int)
 
 class DatabaseBusy(CoalesceDBError): ...              # Another connection holds SQLite's lock past
                                                       # busy_timeout_s, or the database is being deleted,
                                                       # renamed or restored (§6.3, §6.4). Added at M5
 class DatabaseInUse(CoalesceDBError): ...             # delete/rename/restore refused: other sessions have
                                                       # the database open; .active_sessions: int. Added at M5
+                                                      # DatabaseInUse(user_message=None, *, db_name: str,
+                                                      #   active_sessions: int); with no user_message it builds
+                                                      #   the §6.3 sentence ("1 other session" / "N other sessions")
+class AlreadyRunning(CoalesceDBError): ...            # acquire_instance_lock (§6.3): another process holds the
+                                                      # data folder. "CoalesceDB is already running with this
+                                                      # data folder." Added at M5
 class TooManyAttempts(AuthError): ...                 # Server mode: this client address is over the login
                                                       # limit; .retry_after_s: int (§6.1). Added at M24
 
@@ -678,9 +698,12 @@ def verify_password(stored_hash: str, plain: str) -> bool: ...   # constant-time
 # auth/store.py
 class AppStore:
     def __init__(self, path: Path) -> None: ...     # Creates schema; WAL mode; foreign_keys=ON
-        # From M5: optional keyword busy_timeout_s: float = 10.0 (today's fixed value); the
-        # app's wiring passes settings.busy_timeout_s. A lock on app.db that outlasts it
-        # raises DatabaseBusy (§4), like a user database (§6.4).
+        # From M5: optional keyword busy_timeout_s: float = 10.0 (today's fixed value). From
+        # M6 the app's wiring (build_services, §8.1) always passes settings.busy_timeout_s;
+        # the 10 s default exists only so callers written before M5 (tests, M2/M3 code) keep
+        # working unchanged. A lock on app.db that outlasts it raises DatabaseBusy (§4), like a
+        # user database (§6.4). The translation covers opening the store, every query and
+        # every transaction (the same busy test as §6.4).
     def has_any_user(self) -> bool: ...
     # Low-level CRUD used only by AuthService; all queries parameterized.
 
@@ -905,7 +928,8 @@ class DatabaseRegistry:
         # backups is injected (as for the Executor, §6.6), never created here.
         # locks (added at M5, optional keyword): None -> the registry creates its own
         # DatabaseLocks, so M3 tests keep working unchanged. The app's wiring always
-        # passes the ONE shared object (see "Maintenance lock" below).
+        # passes the ONE shared object (see "Maintenance lock" below). It is kept as the
+        # public attribute registry.locks. The registry never reads backups.locks.
 
     def path_for(self, db_name: str) -> Path: ...
         # 1. validate_db_name(db_name)  (§6.8; raises InvalidIdentifier).
@@ -926,9 +950,10 @@ class DatabaseRegistry:
         # create() can be retried.
     def delete(self, actor: User, db_name: str, confirm_text: str,
                *, session_id: str | None = None) -> None: ...
-        # From M5: after the two checks below and before the snapshot, the maintenance
-        # check and exclusive lock ("Maintenance lock" below); session_id is the caller's
-        # own session, which is not counted.
+        # From M5: after the two checks below and before the snapshot, the exclusive lock
+        # ("Maintenance lock" below), held to the end. session_id (optional keyword, M5) is
+        # the caller's own session; it is accepted at M5 and first used at M6, when the
+        # presence check is added in front of the lock and does not count that session.
         # Order: superadmin check → confirm_text == db_name (else PermissionDenied, as in
         # §6.6) → backups.snapshot(path, reason="db_delete") → revoke_all(db_name) → remove
         # the .db file (and any -wal/-shm) → move backups_dir/<name>/ to
@@ -936,8 +961,10 @@ class DatabaseRegistry:
         # If snapshot raises, nothing is deleted or revoked.
     def rename(self, actor: User, old: str, new: str,
                *, session_id: str | None = None) -> None: ...   # updates grants atomically
-        # From M5: the maintenance check and exclusive lock on `old` come after the checks
-        # below and before step 1; on success the sessions that had `old` selected (only
+        # From M5: the exclusive lock on `old` and on `new` (both, taken without waiting, so
+        # no deadlock is possible) comes after the checks below and before step 1, held to
+        # the end. session_id (optional keyword, M5) is first used at M6: the presence check
+        # in front of the lock, and on success the sessions that had `old` selected (only
         # the caller's own can remain) are moved to `new`.
         # superadmin only. Checked before anything moves: both names valid; old exists
         # (DatabaseNotFound); new file does not exist and backups_dir/<new>/ does not exist
@@ -984,13 +1011,16 @@ class DatabaseLocks:
         # lock itself: its caller already holds one (the Executor a shared one; delete and
         # restore the exclusive one), and taking a second would refuse itself.
         # Any number of holders at once. If the exclusive lock is held:
-        # DatabaseBusy("Database busy. It is being renamed, restored or deleted. ...").
+        # DatabaseBusy("Database busy. It is being renamed, restored or deleted. Try again in a moment.").
     @contextmanager
     def exclusive(self, db_name: str) -> Iterator[None]: ...
-        # Held by registry.delete, registry.rename (on the old name; the new name is
-        # reserved the same way) and BackupService.restore for their whole length.
-        # Never waits: if any shared or exclusive holder exists -> DatabaseBusy.
+        # Held by registry.delete, registry.rename (on the old name and on the new name,
+        # both) and BackupService.restore for their whole length.
+        # Never waits: if any shared or exclusive holder exists ->
+        # DatabaseBusy("Database busy. It is still in use. Try again in a moment.").
 ```
+
+Locks are keyed by the database name as given. Database names are lowercase only (`DB_NAME_RE`, §6.8), so two spellings of one name cannot hold separate locks.
 
 Two layers, in this order, in `delete`, `rename` and `restore`:
 
@@ -999,9 +1029,22 @@ Two layers, in this order, in `delete`, `rename` and `restore`:
 
 Both layers are needed: the presence check gives a clear, early refusal with a number; the lock closes the gap between that check and the file operation, and covers an operation that is still running for a session that has already switched to another database.
 
+**What M5 builds and what waits for M6.** M5: `DatabaseLocks`, the exclusive lock in `delete`, `rename` and `restore`, the `session_id` keyword on all three, and the presence check in `restore` through its injected `in_use` callable (§6.7; tested with a fake). M6: the presence check in the registry's `delete` and `rename` (it needs `auth.sessions_using`, which arrives with sessions) and the wiring that passes `auth.sessions_using` as `in_use`.
+
 **One shared object.** The lock only works if the registry, the Executor and the BackupService hold the same `DatabaseLocks`. `build_services` (§8.1) creates one and passes it to all three; `test_wiring.py` asserts `registry.locks is executor.locks is backups.locks`. Each class also accepts `locks=None` and then creates a private one, which keeps M3 tests unchanged and is correct for a test that uses one class alone.
 
 **One process per data folder (added at M5).** `DatabaseLocks` lives in memory, so it protects only if a single process uses the data folder. At startup the app calls `acquire_instance_lock(settings)` (in `db/locks.py`; called by `ui/main.run` from M6 and by the launcher from M11), which takes an OS file lock on `settings.instance_lock_path` (stdlib: `fcntl.flock` on macOS/Linux, `msvcrt.locking` on Windows) and holds it until exit. If it is already held, the app does not start and says: "CoalesceDB is already running with this data folder." This also stops a desktop app and a server from being pointed at the same folder.
+
+```python
+class InstanceLock:
+    # Holds the open lock file. release() unlocks and closes it; also a context manager.
+    def release(self) -> None: ...
+def acquire_instance_lock(settings: Settings) -> InstanceLock: ...
+    # settings.instance_lock_path None -> ValueError. Lock already held (by another
+    # process, or by another InstanceLock in this one) -> AlreadyRunning (§4).
+    # The file is created with mode 0o600 where the OS supports it, is never written
+    # to, and is never deleted. The msvcrt branch is first tested on Windows CI at M12.
+```
 
 **Never over a network share.** SQLite's locking is not reliable on network file systems, and WAL mode does not work across machines. The data folder must be on a local disk of the machine that runs the app; in server mode that is the server, and clients never see a file path, only pages. The setup guide (§14) says so. The app cannot reliably detect a network drive on every OS, so this is a documented requirement plus the instance lock, not a check.
 
@@ -1018,6 +1061,10 @@ def open_connection(path: Path, role: Role, timeout_s: float,
     # busy_timeout_s: added at M5, optional keyword. None keeps the M3 behaviour (the
     # query timeout doubles as SQLite's lock wait). The Executor always passes
     # settings.busy_timeout_s.
+    # From M5 the yielded object is a small sqlite3.Connection subclass (connect(...,
+    # factory=...)) with one extra method, restart_deadline(): it starts the timeout_s
+    # clock again from now. The Executor calls it once BEGIN IMMEDIATE has succeeded
+    # (§6.6), so time spent waiting for the write lock never counts as running time.
 ```
 
 Requirements:
@@ -1040,8 +1087,8 @@ Requirements:
   - A statement the authorizer denies raises `sqlite3.DatabaseError` ("not authorized") from the connection. Turning that into the app's `ExecutionError` is the Executor's job (§6.6).
   - **Do not deny writes to `sqlite_*` tables for admins.** SQLite reports every `CREATE`, `DROP` and `ALTER` as a write to `sqlite_master`, so that rule blocks all schema changes. Direct tampering (`UPDATE sqlite_master`, `PRAGMA writable_schema`) is already stopped by guard step 7 and the PRAGMA deny. `test_authorizer.py` must confirm that `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` succeed for admins.
   - Note: introspection (§6.5) uses a separate internal connection opened by `open_internal_connection(path)` that is read-only (`mode=ro`, `query_only`), allows only the read-only PRAGMAs `table_info`, `foreign_key_list`, `index_list` and `integrity_check` (the last is needed by `import_file`, §6.3), and is never exposed to user SQL. It also allows the read-only `data_version` PRAGMA, because SQLite runs it internally as part of `integrity_check` and reports it to the authorizer (checked on SQLite 3.53.1); without it `integrity_check` is refused. The internal connection has a fixed timeout of 30 s (it has no `timeout_s` argument); this mainly bounds `integrity_check` on a large import. App metadata such as column units (§6.26) is stored in `app.db`, not in user databases, so no internal *write* connection to user databases is needed.
-- **Busy database (added at M5):** two different waits exist and are kept apart. `timeout_s` is how long a statement may *run* (the progress handler below). `busy_timeout_s` is how long SQLite *waits for another connection's lock* before giving up (`sqlite3.connect(..., timeout=busy_timeout_s)`). When that wait runs out, SQLite raises `sqlite3.OperationalError` with `sqlite_errorcode` `SQLITE_BUSY` (or `SQLITE_LOCKED`); `open_connection` turns exactly those into `DatabaseBusy`, with the message "Database busy. Another change is being saved. Try again in a moment." Any other `OperationalError` is left for the Executor (§6.6). In WAL mode readers never wait for a writer, so this mostly concerns two writes at the same moment; an imported file that no admin connection has opened yet is still in rollback-journal mode, where a write also makes readers wait.
-- **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`.
+- **Busy database (added at M5):** two different waits exist and are kept apart. `timeout_s` is how long a statement may *run* (the progress handler below). `busy_timeout_s` is how long SQLite *waits for another connection's lock* before giving up (`sqlite3.connect(..., timeout=busy_timeout_s)`). When that wait runs out, SQLite raises `sqlite3.OperationalError` with `sqlite_errorcode` `SQLITE_BUSY` (or `SQLITE_LOCKED`); `open_connection` turns exactly those into `DatabaseBusy`, with the message "Database busy. Another change is being saved. Try again in a moment." Any other `OperationalError` is left for the Executor (§6.6). **The busy test:** `getattr(exc, "sqlite_errorcode", None)`, masked with `& 0xFF`, is `sqlite3.SQLITE_BUSY` or `sqlite3.SQLITE_LOCKED`. Python reports extended codes (for example `SQLITE_BUSY_TIMEOUT`), and an `OperationalError` not raised by SQLite has no `sqlite_errorcode` at all, which counts as not busy. The translation covers the PRAGMAs run while opening (`PRAGMA journal_mode = WAL` can itself be busy) and any error that leaves the `with` block. An error caught inside the block is not translated: that is how the Executor sees the raw busy error of `BEGIN IMMEDIATE` and retries it (§6.6). In WAL mode readers never wait for a writer, so this mostly concerns two writes at the same moment; an imported file that no admin connection has opened yet is still in rollback-journal mode, where a write also makes readers wait.
+- **Timeout:** `conn.set_progress_handler(handler, 10_000)` where `handler` returns non-zero once `time.monotonic()` exceeds the deadline; translate the resulting `sqlite3.OperationalError("interrupted")` into `QueryTimeout`. `timeout_s` limits how long statements *run*; for writes the clock restarts when `BEGIN IMMEDIATE` succeeds (`restart_deadline()`, above), so the busy wait and its retries are never charged to it.
 
 ### 6.5 Introspection — `db/introspect.py`
 
@@ -1049,6 +1096,11 @@ Requirements:
 def list_tables(path: Path) -> list[TableInfo]: ...
     # Excludes sqlite_* and _app_* tables. Tables only, not views. A foreign key that names
     # no target column is resolved to the referenced table's primary key.
+def object_names(path: Path) -> set[str]: ...
+    # Added at M5. Names of the tables AND views in sqlite_master, skipping sqlite_* and
+    # _app_* names. No row counts, so it is cheap enough to run before every statement:
+    # the Executor passes it to the guard as known_tables (§6.6). Uses the internal
+    # read-only connection (§6.4).
 def schema_ddl(path: Path, *, max_chars: int = 6000) -> str: ...
     # For prompts. Each table's CREATE statement from sqlite_master, followed by a comment
     # with its row count (e.g. "-- 150 rows"). The project has no tokenizer, so the budget
@@ -1075,11 +1127,16 @@ Source = Literal["manual_sql", "nl", "builder", "editor", "designer", "ingest",
 class Executor:
     def __init__(self, settings: Settings, registry: DatabaseRegistry,
                  auth: AuthService, backups: BackupService,
-                 *, locks: DatabaseLocks | None = None) -> None: ...
+                 *, locks: DatabaseLocks | None = None,
+                 sleep: Callable[[float], None] = time.sleep) -> None: ...
         # locks: None -> uses registry.locks, so the two can never differ by accident (§6.3).
+        # Kept as the public attribute executor.locks.
+        # sleep: the pause between BEGIN IMMEDIATE retries; tests inject a fake.
 
     def preview(self, session: Session, sql: str) -> GuardResult: ...
-        # Runs the guard only. Used to render the review drawer.
+        # Runs the guard only, nothing else. Used to render the review drawer. It reads the
+        # database's table and view names for known_tables (introspect.object_names, §6.5)
+        # under locks.shared, and opens no connection that could run the SQL. Not audited.
 
     def execute(self, session: Session, sql: str, *, source: Source,
                 params: Sequence[Any] | None = None,
@@ -1092,12 +1149,21 @@ class Executor:
                      confirmed: bool, batch_size: int = 1000) -> int: ...
         # For parameterized bulk INSERTs (§6.14, §6.15, §6.19, §6.20). The SQL is guarded
         # once and must be a single INSERT ... VALUES with only "?" placeholders as values.
+        # Shape check (after the guard, on guard.normalized_sql parsed with sqlglot): the
+        # root is an INSERT whose VALUES hold exactly one row, and every value in it is an
+        # anonymous "?". Named placeholders (":x"), literals, several rows and
+        # INSERT ... SELECT -> SQLRejected, before anything runs.
         # All batches run in ONE transaction; any failure rolls back everything. Returns row count.
 
     def apply_schema(self, session: Session, ddl: list[str], *, source: Source,
                      confirmed: bool) -> None: ...
         # Several DDL statements in ONE transaction (§6.13, §6.15, §6.19). Each statement is
-        # guarded individually; one rejection rejects all. Snapshot first if the DB has tables.
+        # guarded individually; one rejection rejects all. Snapshot first
+        # (reason="schema_change") if the DB has at least one table.
+        # Only CREATE TABLE, CREATE INDEX, CREATE VIEW and ALTER TABLE are accepted. A
+        # statement the guard marks destructive (DROP, DROP COLUMN, renames) -> SQLRejected
+        # for the whole batch: this method has no destructive_confirm_text. The table
+        # designer runs its drops and renames through execute (§6.29).
 
     def apply_changes(self, session: Session,
                       statements: Sequence[tuple[str, Sequence[Any]]], *,
@@ -1126,25 +1192,40 @@ class Executor:
         # errors without changing data. Raises ExecutionError or QueryTimeout on failure.
         # This is the only place generate_sql is allowed to touch a user database, and it
         # still does not run the user's SQL.
+        # Built at M5 (first used at M7). "EXPLAIN " + guard.normalized_sql is the one place
+        # SQL text is joined: a fixed keyword put in front of SQL the guard has already
+        # approved. No value and no identifier is ever added this way, so it does not break
+        # the rule that values are bound and identifiers are quoted. Runs under
+        # locks.shared, never retried, never in a transaction. Audited only when refused
+        # (query_rejected); a successful dry run writes a trace line, no audit entry.
 ```
+
+**Order of the steps.** Every method above except `preview` and `dry_run` follows the numbered contract below. `session.db_name` is `None` → `PermissionDenied`, before step 1. `locks.shared(session.db_name)` is taken **right after step 1** and held until the method returns, so the table names read for step 2 (`introspect.object_names`, §6.5) and everything after it happen under the lock.
 
 Contract for `execute`, `execute_many`, `apply_schema` and `apply_changes`:
 
 1. Re-resolve role from `auth.role_for(session.user, session.db_name)`. **Do not trust `session.role`.** None → `PermissionDenied`.
-2. Guard every statement with `validate(sql, role, known_tables, max_sql_chars=settings.max_sql_chars)`; if any is not allowed → audit `query_rejected`, raise `SQLRejected(guard.reasons)`. **`GuardResult.tables_touched` is not a complete list** and the Executor must not use it for any security decision: it holds the names the guard recognised as tables, and SQL can reach a table in ways the parser does not model as one (§6.2 step 7, the `IN` rule). Whether a statement may run is decided only by `guard.allowed`; `tables_touched` is for display and tracing.
+2. Guard every statement with `validate(sql, role, known_tables, max_sql_chars=settings.max_sql_chars)`, where `known_tables` is `introspect.object_names(path)` (tables and views, §6.5); if any is not allowed → audit `query_rejected`, raise `SQLRejected(guard.reasons)`. **`GuardResult.tables_touched` is not a complete list** and the Executor must not use it for any security decision: it holds the names the guard recognised as tables, and SQL can reach a table in ways the parser does not model as one (§6.2 step 7, the `IN` rule). Whether a statement may run is decided only by `guard.allowed`; `tables_touched` is for display and tracing.
 3. Any write without `confirmed=True` → `PermissionDenied("confirmation required")`. UI flows pass `confirmed=True` only after the user clicks the confirm button on a screen showing what will be written.
-4. If `guard.is_destructive`: `destructive_confirm_text` must equal the database name; then `backups.snapshot(path, reason=...)` before executing.
-5. Open a connection via §6.4 with the resolved role and run `guard.normalized_sql`. **Values are only ever passed through `params` / `rows` as bound parameters** — never formatted into the SQL string.
-6. SELECT row cap: `max_rows` if given, else `max_result_rows`, and never more than `max_export_rows`. Use `fetchmany(cap + 1)` to set `truncated`.
-7. Writes run inside `BEGIN IMMEDIATE ... COMMIT`, rolled back on any exception.
-8. Audit `query` (or `export` / `ingest` / `sql_import` / `live_import` per `source`) with SQL, kind, row_count, elapsed, source, and from M24 `client_addr=session.client_addr` (§6.1). Parameter values are never written to the audit log. Builder, editor and designer statements are audited as `query` with their own `source` value, so the audit log shows where each statement came from.
+4. If `guard.is_destructive`: `destructive_confirm_text` must equal the database name (else `PermissionDenied`, as in §6.3); then `backups.snapshot(path, reason=...)` before executing. Snapshot reasons: `destructive_query` (execute), `schema_change` (apply_schema), `editor_delete` (apply_changes).
+5. Open a connection via §6.4 with the resolved role and `busy_timeout_s=settings.busy_timeout_s`, and run `guard.normalized_sql`. **Values are only ever passed through `params` / `rows` as bound parameters** — never formatted into the SQL string. Any `sqlite3.Error` that is not busy, not a timeout and not a `RowConflict` becomes `ExecutionError(sqlite_message=str(exc))`, including "not authorized" from the authorizer and a wrong number of bindings.
+6. Row cap: `max_rows` if given, else `max_result_rows`, and never more than `max_export_rows`; `max_rows < 1` → `ValueError`. Use `fetchmany(cap + 1)` to set `truncated`. A write with `RETURNING` (the guard allows it) returns its rows under the same cap, and its cursor is closed before `COMMIT`. `row_count` is rows returned for a SELECT, rows changed for DML, and 0 for DDL (never SQLite's -1).
+7. Writes run inside `BEGIN IMMEDIATE ... COMMIT`, rolled back on any exception. After `BEGIN IMMEDIATE` succeeds the Executor calls `conn.restart_deadline()` (§6.4).
+8. Audit `query` (or `export` / `ingest` / `sql_import` / `live_import` per `source`) with SQL, kind, row_count, elapsed, source, and from M24 `client_addr=session.client_addr` (§6.1). Parameter values are never written to the audit log. Builder, editor and designer statements are audited as `query` with their own `source` value, so the audit log shows where each statement came from. **Source → action:** `export`, `ingest`, `sql_import` and `live_import` are audited under that name; every other source (`manual_sql`, `nl`, `builder`, `editor`, `designer`, `analyze`, `system`) as `query`. The SQL recorded is `guard.normalized_sql`, the text that actually ran.
 
-**Maintenance lock.** Every method above (except `preview`, which opens no file) runs inside `locks.shared(session.db_name)` from step 4 on, so the snapshot is covered too. If the database is being deleted, renamed or restored it raises `DatabaseBusy` and nothing runs (§6.3).
+**One audit entry per call, whatever the outcome.**
+
+- **Refused before anything runs** → `query_rejected`, with `reasons`. This covers every refusal, not only the guard's: no database selected, no role, a guard rejection, a missing confirmation, a wrong destructive confirmation text, and the shape rules of `execute_many`, `apply_schema` and `apply_changes`. The SQL recorded for a refusal is the text as given, cut to `settings.max_sql_chars` characters, with its full length in `sql_length`, so an oversized statement cannot bloat `app.db`.
+- **Failed after it started** (`ExecutionError`, `QueryTimeout`, `RowConflict`) → `query_failed`, with the error's class name (and `statement_index` for `RowConflict`). Never SQLite's message text.
+- **Busy** → `query_busy` (see below).
+- **The audit write itself fails after a write has committed** (for example `app.db` is busy): the Executor never reports a committed write as not done, because the user would try again and run it twice. It writes an `audit_failed` trace line (§6.17) and raises `ExecutionError("The change was saved, but it could not be recorded in the audit log. Tell your administrator.")`.
+
+**Maintenance lock.** Every method above, `preview` and `dry_run` included, runs inside `locks.shared(session.db_name)` from right after step 1 (see "Order of the steps"), so the table-name read, the snapshot and the statement are all covered. If the database is being deleted, renamed or restored it raises `DatabaseBusy` and nothing runs (§6.3).
 
 **Busy handling and retry rules (both modes).** Several people can write to one database, so a write can find SQLite's lock taken.
 
 - SELECTs and `dry_run` are never retried. If `open_connection` raises `DatabaseBusy` (§6.4) it goes to the user.
-- For writes, the only step that is ever retried is **acquiring the write lock**: `BEGIN IMMEDIATE`. SQLite itself waits `busy_timeout_s` for it. If it still fails with `SQLITE_BUSY`, nothing has run yet, so the Executor tries `BEGIN IMMEDIATE` again, at most `busy_retries` more times, sleeping 0.1 s then 0.3 s between tries. After that: `DatabaseBusy`.
+- For writes, the only step that is ever retried is **acquiring the write lock**: `BEGIN IMMEDIATE`. SQLite itself waits `busy_timeout_s` for it. If it still fails with `SQLITE_BUSY`, nothing has run yet, so the Executor tries `BEGIN IMMEDIATE` again, at most `busy_retries` more times, sleeping 0.1 s before the first retry and 0.3 s before every later one. After that: `DatabaseBusy`. **Where the retry happens:** inside the `open_connection` block, on the same connection. The Executor catches the raw `sqlite3.OperationalError` of the `BEGIN IMMEDIATE` statement alone and applies the busy test of §6.4. A busy error from any later statement (including `COMMIT`) is not caught there: the Executor rolls back and lets it leave the block, where `open_connection` turns it into `DatabaseBusy`.
 - **Never retried:** anything after `BEGIN IMMEDIATE` succeeded (a failure there rolls back and is reported; running a write twice is never safe to do silently); `QueryTimeout`; `SQLRejected`; `PermissionDenied`; `RowConflict`; a missing confirmation; any `ExecutionError`.
 - The role check, the guard, the confirmation checks and the snapshot (step 4) happen once, before the first attempt. A retry repeats none of them, and takes no second snapshot.
 - One audit entry per call, whatever the number of attempts; `detail` records `busy_retries_used` when it is not 0. A call that ends in `DatabaseBusy` is audited as `query_busy` with the SQL and no row count.
@@ -1157,10 +1238,15 @@ Contract for `execute`, `execute_many`, `apply_schema` and `apply_changes`:
 ```python
 class BackupService:
     def __init__(self, settings: Settings, *, locks: DatabaseLocks | None = None,
-                 in_use: Callable[..., int] | None = None) -> None: ...
-        # Both added at M5 as optional keywords. locks: None -> its own DatabaseLocks (§6.3).
-        # in_use: the wiring passes auth.sessions_using (BackupService does not import
-        # AuthService); None -> no presence check (tests that use the class alone).
+                 in_use: Callable[..., int] | None = None,
+                 auth: AuthService | None = None) -> None: ...
+        # All three added at M5 as optional keywords. locks: None -> its own DatabaseLocks
+        # (§6.3); kept as the public attribute backups.locks.
+        # in_use: the wiring passes auth.sessions_using; None -> no presence check (tests
+        # that use the class alone).
+        # auth: used by restore() only, for the admin check (role_for) and its audit entry.
+        # The type is imported under TYPE_CHECKING only, so backup.py still does not import
+        # auth/ at run time. None -> restore() raises PermissionDenied (safe default).
     def snapshot(self, db_path: Path, reason: str) -> Path: ...
         # Uses sqlite3 Connection.backup() into backups_dir/<db>/<ts>_<reason>.db
         # <db> is db_path's file name without ".db", validated with validate_db_name (§6.8)
@@ -1171,12 +1257,35 @@ class BackupService:
         # Prunes to settings.backups_to_keep per database, oldest first. Pruning only ever
         # deletes regular files directly inside backups_dir/<db>/.
     def list(self, db_name: str) -> list[tuple[datetime, str, Path]]: ...
+        # (UTC time, reason, path), newest first. db_name validated (validate_db_name).
+        # Only regular files directly inside backups_dir/<db_name>/ whose names match the
+        # snapshot pattern; anything else (other files, folders, links) is skipped. No folder
+        # -> []. Takes no actor: it returns names and times, no data. The Admin page
+        # (superadmins) is its only caller.
     def restore(self, actor: User, db_name: str, backup_path: Path,
                 *, session_id: str | None = None) -> None: ...
-        # Admin on that DB; snapshots current state first; validates path is within backups_dir.
-        # Replaces the database file, so it follows the maintenance rules of §6.3:
-        # in_use(db_name, exclude_session_id=session_id) != 0 -> DatabaseInUse. Then
-        # locks.exclusive(db_name) around the snapshot and the file replacement.
+        # Replaces the database file, so it follows the maintenance rules of §6.3.
+        # Order:
+        #   1. auth is None, or auth.role_for(actor, db_name) is not ADMIN -> PermissionDenied.
+        #   2. backup_path must be a regular file (not a link) directly inside
+        #      backups_dir/<db_name>/ (compared after resolve()) whose name matches the
+        #      snapshot pattern. Another database's folder and _deleted are refused
+        #      (InvalidIdentifier). The database file must exist (DatabaseNotFound).
+        #   3. in_use(db_name, exclude_session_id=session_id) != 0 -> DatabaseInUse.
+        #   4. locks.exclusive(db_name), held to the end.
+        #   5. Copy the chosen backup to a temporary file in databases_dir FIRST, named
+        #      ".restore-<random hex>.tmp" (a name list_databases ignores, like the import
+        #      temp file of §6.3). This comes before step 7 because the pre_restore snapshot
+        #      prunes, and could otherwise delete the very backup being restored.
+        #   6. Check the copy: SQLite header and PRAGMA integrity_check == ok (internal
+        #      connection, §6.4). A failure -> IngestError, nothing replaced.
+        #   7. snapshot(path, reason="pre_restore").
+        #   8. Remove the current database's -wal and -shm files (a stale log must never be
+        #      applied to the restored file), then os.replace(copy, path).
+        #   9. Audit 'db_restore' with {"backup": <file name only>}.
+        # The temporary copy (and any -wal/-shm beside it) is removed on every failure, in
+        # a finally block. A copy left behind by a crash is never listed as a database
+        # and never touched by list() or restore().
 ```
 
 Built in two steps: `snapshot()` (including pruning) in M3, because the registry's `delete()` needs it; `list()` and `restore()` in M5.
@@ -1543,13 +1652,32 @@ The syllabus template runs Pass 1 on `courses` + `grade_weights`, then Pass 2 on
 ### 6.17 Observability — `observability/tracing.py`
 
 ```python
+def configure_tracing(path: Path | None) -> None: ...
+    # Added at M5. Where trace lines go. None (the default when nothing calls this) means
+    # tracing is off and nothing is written anywhere. From M6 the wiring (build_services,
+    # §8.1) passes settings.traces_path; tests pass a temporary file.
 @contextmanager
 def trace(event: str, **attrs) -> Iterator[dict]: ...
     # Appends one JSON line to traces.jsonl on exit: ts, event, elapsed_ms, attrs, error.
+    # error is the exception's class name only (e.g. "ExecutionError"), never its message,
+    # which can quote SQL or values. Lines are appended under one threading.Lock, so
+    # threads never interleave them. The file is created with mode 0o600 where supported.
+    # The yielded dict can be filled in during the block (row_count, etc.).
 def recent(n: int = 100) -> list[dict]: ...
+    # The last n lines, oldest first. [] when tracing is off or the file does not exist.
 ```
 
-Traced: every LLM call (model, tokens, latency), every guard decision, every execution. No document text or query results are written to traces (only lengths and hashes).
+Traced: every LLM call (model, tokens, latency), every guard decision, every execution. No document text or query results are written to traces (only lengths).
+
+**What the Executor traces (M5).** Allowed attributes only; nothing else goes in:
+
+- `guard`: `allowed`, `kind`, `is_destructive`, `reason_count`, `sql_chars`, `tables_touched`.
+- `execute`: `method`, `source`, `db_name`, `user_id`, `kind`, `statement_count`, `row_count`, `truncated`, `busy_retries_used`.
+- `audit_failed`: `method`, `db_name`, `user_id` (§6.6).
+
+Never in a trace: SQL text, a hash of SQL (a hash of short SQL can be reversed by guessing), parameter values, result rows, passwords, session ids, error messages.
+
+**Known limitation:** `traces.jsonl` is never rotated or trimmed. Revisit when it matters.
 
 ### 6.18 Permissions for Version 2 Features
 
@@ -2822,7 +2950,15 @@ Every row was re-read for server mode (M24) with two attackers in mind: **someon
 
 `test_auth.py`: usernames like `admin'--`, `x; DROP TABLE users`, `a b`, `ab`, `"abc\n"` are rejected; lockout after 5 failures; timing path for unknown and malformed usernames calls verify exactly once; last superadmin cannot be deleted; `role_for()` returns `None` right after a revoke and `VIEWER` right after an admin is downgraded; changing your own password needs the current one, and wrong ones count toward the lockout; a superadmin reset clears the lockout; unknown user ids raise `UserNotFound`; malformed database names (incl. `"abc\n"`) are rejected by `grant`, `revoke` and `role_for`; a canary password and a canary typed username never appear in the raw bytes of `app.db` or its WAL file.
 
-`test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute. The Executor passes `settings.max_sql_chars` to the guard (§6.2 step 1): with a small configured limit, SQL one character over it is rejected through the Executor and SQL exactly at it is not. It also covers `apply_changes`: several statements commit together; a failure in the last one rolls back the first; a viewer is refused; `confirmed=False` is refused; a statement that is not INSERT/UPDATE/DELETE, or an UPDATE/DELETE without WHERE, rejects the whole batch before anything runs; an UPDATE that matches 0 rows raises `RowConflict` with the right index and leaves the database unchanged; a batch with a DELETE takes a snapshot first and one without does not; one audit entry is written and it contains no parameter values.
+`test_executor.py` (M5) holds the execute-level versions of the grant checks: a revoked grant blocks the next execute, and an admin downgraded to viewer can no longer write on the next execute. The Executor passes `settings.max_sql_chars` to the guard (§6.2 step 1): with a small configured limit, SQL one character over it is rejected through the Executor and SQL exactly at it is not. It also covers `apply_changes`: several statements commit together; a failure in the last one rolls back the first; a viewer is refused; `confirmed=False` is refused; a statement that is not INSERT/UPDATE/DELETE, or an UPDATE/DELETE without WHERE, rejects the whole batch before anything runs; an UPDATE that matches 0 rows raises `RowConflict` with the right index and leaves the database unchanged; a batch with a DELETE takes a snapshot first and one without does not; one audit entry is written and it contains no parameter values. It also covers the M5 contract decisions in §6.6: the audit action for each outcome (`query`, `query_rejected` for every refusal, `query_failed` with the class name only, oversized SQL cut to `max_sql_chars`), the `execute_many` shape check, `apply_schema` refusing destructive statements, `RETURNING`, `preview` with a view giving no unknown-table warning, and `dry_run` (a missing table → `ExecutionError`, a valid INSERT is not executed).
+
+`test_executor_busy.py` (M5): a write that finds SQLite's lock held by a second connection raises `DatabaseBusy` after `busy_timeout_s` (set small in the test, with a large `query_timeout_s`), not `QueryTimeout` and not a raw `sqlite3` error, and is audited as `query_busy`; the injected sleep records 0.1 then 0.3; `BEGIN IMMEDIATE` is retried `busy_retries` times and succeeds when the other connection lets go in between, with `busy_retries_used` in the audit detail; a statement that failed after `BEGIN IMMEDIATE` is not run a second time (the row is inserted exactly once); exactly one snapshot and one audit entry however many retries; a SELECT is never retried; a write that gets the lock on its last try still has its whole `query_timeout_s` to run; `open_connection` with `busy_timeout_s` raises `DatabaseBusy` and leaves other `OperationalError`s raw. (These were listed under `test_maintenance_lock.py` before M5 was split into two rounds; they belong to the Executor round.)
+
+`tests/security/test_executor_canary.py` (M5): a canary password, a canary parameter value and a canary value read back by a SELECT appear nowhere in `app.db`'s bytes, `traces.jsonl` or `read_audit()`, nor in any error message; with the guard patched to allow everything, a viewer's write is still refused by the read-only connection and the authorizer and an admin's ATTACH by the authorizer; a guard result with an empty `tables_touched` still runs (no decision is taken from it); Executor calls make no network connection (`socket.socket.connect` patched to raise). The manual canary search at the end of M5 covers the password canary in app.db, traces.jsonl and the backups folder; the parameter and result canaries only in app.db and traces.jsonl, because backups contain user data by design.
+
+`test_backup_restore.py` (M5): `list` is newest first and skips files that do not match; `restore` brings back the backup's content after a `pre_restore` snapshot; it refuses a non-admin, a missing `auth`, another database's backup, `_deleted`, a link, a non-snapshot name and a damaged backup (nothing replaced); restoring the oldest backup with `backups_to_keep=2` works; stale `-wal`/`-shm` files are removed; `registry.list_databases()` never shows the temporary copy during a restore, and a leftover copy from a crash is ignored; `in_use` gives `DatabaseInUse` with "1 other session" / "2 other sessions" and receives `session_id` as `exclude_session_id`; one `db_restore` audit entry.
+
+`test_appstore_busy.py` (M5): `AppStore(path, busy_timeout_s=0.1)` raises `DatabaseBusy` while another connection holds the write lock; `AppStore(path)` keeps the 10 s default.
 
 Visual builder tests (no model, no browser):
 
@@ -2837,7 +2973,7 @@ Local web UI tests (M6; they use NiceGUI's own server-side test helper, no brows
 
 Multi-user and server-mode tests. **Rule for all of them: existing test files are never edited.** New behaviour is tested in the new files below; every new constructor or method argument is an optional keyword whose default keeps the earlier tests passing as they are.
 
-- `test_maintenance_lock.py` (M5): `shared` allows several holders; `exclusive` is refused with `DatabaseBusy` while a shared or exclusive holder exists and never waits; `shared` is refused while `exclusive` is held; locks on different databases do not affect each other; a lock is released when its block raises. Registry `delete` and `rename` and `BackupService.restore` raise `DatabaseBusy` and change nothing while another thread holds `shared`. A write that finds SQLite's lock held by a second connection raises `DatabaseBusy` after `busy_timeout_s` (set small in the test), not `QueryTimeout` and not a raw `sqlite3` error; `BEGIN IMMEDIATE` is retried `busy_retries` times and succeeds when the other connection lets go in between; a statement that failed after `BEGIN IMMEDIATE` is not run a second time (the row is inserted exactly once); exactly one snapshot and one audit entry however many retries; a second process cannot take the instance lock.
+- `test_maintenance_lock.py` (M5): `shared` allows several holders; `exclusive` is refused with `DatabaseBusy` while a shared or exclusive holder exists and never waits; `shared` is refused while `exclusive` is held; locks on different databases do not affect each other; a lock is released when its block raises. Registry `delete` and `rename` (on the old name and on the new name) and `BackupService.restore` raise `DatabaseBusy` and change nothing while another thread holds `shared`; while `delete` holds `exclusive`, an Executor call raises `DatabaseBusy` and runs nothing; an Executor built with `locks=None` uses `registry.locks`; a second process cannot take the instance lock (`AlreadyRunning`) and can after `release()`; `instance_lock_path=None` raises `ValueError`. The busy-handling checks are in `test_executor_busy.py`.
 - `test_wiring.py` (M6): `build_services(settings)` gives the registry, the Executor and the BackupService the same `DatabaseLocks` object (`is`), and `backups.in_use` is `auth.sessions_using`; a registry built without `locks` still works alone.
 - `tests/security/test_sessions.py` (M6): `start_session` returns a new id on every call, and two logins never share one; **an id that was in storage before login is not the id after login, and the old id is no longer valid** (no session fixation); `get_session` returns `None` for an unknown id, for a deleted user, and after the idle timeout (clock injected), and deletes the expired row; with the timeout 0 a session never idles out; `end_all_sessions` ends every session of that user and nobody else's, and a non-superadmin cannot end another user's; own password change, superadmin password reset and user deletion each end all of that user's sessions; `sessions` is empty after `AppStore` is opened again; `sessions_using` counts other live sessions only; delete, rename and restore raise `DatabaseInUse` with the right number while another session has the database selected, and succeed after it switches away; the session id appears in no audit entry and no trace line.
 - `tests/security/test_server_mode.py` (M24): with `mode="server"` settings, `run_kwargs` has `ssl_certfile` and `ssl_keyfile`, `native is False`, `show is False`, `proxy_headers is False`, `https_only is True` and `same_site == "strict"`; loading settings fails, naming the variable, for a missing certificate or key, an unset or wildcard `allowed_hosts`, a non-loopback `ollama_host`, and TLS paths in desktop mode; a request whose `Host` is not in `allowed_hosts` is refused and one that is in it is accepted, with the list taken from settings (the test uses a name that appears nowhere in the code); a WebSocket handshake or POST with a foreign `Origin` is refused, and `http://` plus the right host is refused in server mode; responses carry the HSTS header and the session cookie has `Secure`; `/setup` answers 404 from any address, loopback included, and with no user in `app.db` every page leads to `/login`, which shows the "No account yet" text and no form; an `X-Forwarded-For` header does not change the recorded client address; the audit entry of a login and of a query carries the socket address; `/coalescedb/info` returns exactly the three keys and exists only in server mode; the shell in server mode has no "Quit CoalesceDB" item and no handler for it; a non-superadmin has no download or benchmark button and the handlers refuse; reduced transparency set by one user does not change another's. **Client window:** the arguments the app builds for the window contain no `js_api`; `is_allowed_navigation` accepts the profile's own origin and refuses another host, another port, `http://` with the same host, and a look-alike host (`server.company.com.evil.example`); after an address that `is_allowed_navigation` refuses has loaded, the fallback handler sends the window back to the profile's origin (tested on the handler with a fake window object). The tests use a throwaway certificate and key kept under `tests/fixtures/tls/` and marked as test-only; no real key is ever committed.
@@ -2948,14 +3084,14 @@ In this order, so the first screen answers "what is it and does it work":
 | M2 | `AppStore`, `passwords.py`, `AuthService` (§6.1) | `test_auth.py` passes |
 | M3 | `DatabaseRegistry` (§6.3), `connection.py` + authorizer (§6.4), `introspect.py` (§6.5), `BackupService.snapshot` (§6.7) | `test_registry_paths.py`, `test_authorizer.py` pass, incl. admin DDL succeeding; delete() creates a backup first; a failing snapshot leaves the DB and its grants untouched; pruning keeps `backups_to_keep` |
 | M4 | `sql_guard.py`, `policy.py` (§6.2) | Every row of the §11.1 table passes. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. |
-| M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17). **Multi-user groundwork (both modes):** `busy_timeout_s`, `busy_retries` and `instance_lock_path` in `Settings` (§3); `DatabaseBusy` and `DatabaseInUse` (§4); busy handling in `open_connection` (§6.4) and `AppStore`; the Executor retry rules (§6.6); the Executor passing `settings.max_sql_chars` to the guard (§6.2 step 1, §6.6 step 2); `db/locks.py` with `DatabaseLocks` and `acquire_instance_lock`, and the exclusive lock in registry `delete` / `rename` and in `restore` (§6.3, §6.7). These change M2/M3 code only by adding optional keywords; tests first, in new files | `test_executor.py` passes for `execute`, `execute_many`, `apply_schema` and `apply_changes` (incl. `RowConflict` rollback); destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute; SQL one character over a small configured `max_sql_chars` is rejected through the Executor `test_maintenance_lock.py` passes. No existing test file is edited, and all M1-M4 tests pass unchanged. |
-| M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following docs/DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) **Also:** `mode`, `bind_host`, `allowed_hosts` and `session_idle_timeout_s` in `Settings`, with the Host and Origin checks built from them (§3, §8.6); the `sessions` table and its `AuthService` methods, idle timeout, "Log out everywhere", sessions ended on password change, reset and user deletion (§6.1, §8.1, §8.2); `Session.session_id` (§5); the presence check in delete, rename and restore (§6.3); `build_services` passing one shared `DatabaseLocks`. | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. docs/DESIGN.md followed; docs/DESIGN.md §8 checklist (all 7 items) reported `test_sessions.py` and `test_wiring.py` pass; no existing test file is edited. |
+| M5 | `Executor` (§6.6), `BackupService` list/restore (§6.7), tracing (§6.17). **Multi-user groundwork (both modes):** `busy_timeout_s`, `busy_retries` and `instance_lock_path` in `Settings` (§3); `DatabaseBusy` and `DatabaseInUse` (§4); busy handling in `open_connection` (§6.4) and `AppStore`; the Executor retry rules (§6.6); the Executor passing `settings.max_sql_chars` to the guard (§6.2 step 1, §6.6 step 2); `db/locks.py` with `DatabaseLocks` and `acquire_instance_lock`, and the exclusive lock in registry `delete` / `rename` and in `restore` (§6.3, §6.7); `introspect.object_names` (§6.5); `Executor.dry_run` (§6.6, first used at M7). These change M2/M3 code only by adding optional keywords and new functions; tests first, in new files. **Built in two rounds, each with its tests committed (failing) before its code:** round 1, the Executor (`test_config_m5.py`, `test_tracing.py`, `test_executor.py`, `test_executor_busy.py`, `security/test_executor_canary.py`); round 2, maintenance (`test_maintenance_lock.py`, `test_backup_restore.py`, `test_appstore_busy.py`). | `test_executor.py` passes for `execute`, `execute_many`, `apply_schema` and `apply_changes` (incl. `RowConflict` rollback); destructive delete creates a backup; a revoked grant blocks the next execute; an admin downgraded to viewer can no longer write on the next execute; SQL one character over a small configured `max_sql_chars` is rejected through the Executor `test_maintenance_lock.py` passes, and so do the other M5 test files named in the first column. No existing test file is edited, and all M1-M4 tests pass unchanged. |
+| M6 | NiceGUI UI (§8.1, §8.2, §8.3 Write SQL mode only, §8.5, §8.6), following docs/DESIGN.md: login, first-run setup, shell, Write SQL (advanced) mode, admin page; `get_user` and `user_prefs` (§6.1); the two UI paths in `Settings` (§3). Starts with approval for: the NiceGUI pin (§1) and the font files (`assets/fonts/`) **Also:** `mode`, `bind_host`, `allowed_hosts` and `session_idle_timeout_s` in `Settings`, with the Host and Origin checks built from them (§3, §8.6); the `sessions` table and its `AuthService` methods, idle timeout, "Log out everywhere", sessions ended on password change, reset and user deletion (§6.1, §8.1, §8.2); `Session.session_id` (§5); the presence check in delete and rename (§6.3); `build_services` passing one shared `DatabaseLocks`, `auth.sessions_using` as the BackupService's `in_use` and `auth` as its `auth` (§6.7), `settings.busy_timeout_s` to `AppStore` (§6.1), and calling `configure_tracing(settings.traces_path)` (§6.17). | `test_ui_escaping.py` and `test_local_server.py` pass. Manual: two users, viewer blocked from writes in UI *and* by direct executor call; dark mode is remembered per user; reduced transparency works. **Check before relying on it, and STOP and report if any fails:** (1) `NICEGUI_STORAGE_PATH` set in the launcher is honoured (nothing is written to `.nicegui` in the working directory); (2) the Host and Origin middleware also covers the `/_nicegui_ws/` socket; (3) `ui.codemirror` has an SQL mode; (4) pywebview's private mode drops cookies when the window closes, as §8.1 assumes; (5) `backdrop-blur` renders in the desktop webview on Windows and macOS; (6) Tailwind `dark:` variants follow `ui.dark_mode()` in the pinned version. docs/DESIGN.md followed; docs/DESIGN.md §8 checklist (all 7 items) reported `test_sessions.py` and `test_wiring.py` pass; no existing test file is edited. |
 | M7 | `OllamaClient` (§6.10), `text_to_sql.py` (§6.11), prompts (§7.1), Generate SQL mode, Query details panel Model request queue `LLMQueue`, `LLMBusy`, `llm_parallel_server`, `llm_max_queue` (§6.10). **Per-task models:** the `task` keyword on `complete` / `complete_json`, `ladder_for`, `default_model_for`, the four per-task ladder fields and `model_ladder_server` (moved here from M15), `model_temperatures` / `temperature_for`, `LLMCall.temperature`, the `think` switch and `strip_think_blocks` (§3, §5, §6.9, §6.10). | Works end-to-end with Ollama using `settings.default_model`; `FakeLLMClient` tests pass, incl. `Executor.dry_run` / `EXPLAIN`-based self-correction. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported `test_llm_queue.py` passes. Works in server and client mode: two signed-in users generate SQL at the same time, the second sees its queue position. `test_llm_client.py` and the `ladder_for` part of `test_task_ladders.py` pass. **Check before relying on it:** what the installed Ollama answers to `think: false` for a model without the `thinking` capability (the reason the field is sent only with it, §6.10); record the Ollama version. |
 | M8 | Spreadsheet import: `readers.py` XLSX/CSV (§6.12), `tabular.py` (§6.15) | `test_ingest_tabular.py` passes; messy headers normalized. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
 | M9 | PDF reading & chunking (§6.12), `schema_design.py` (§6.13), `extraction.py` (§6.14), templates (§6.16), prompts (§7.2–7.3), Import page (§8.4) | `test_schema_design.py`, `test_extraction.py` pass incl. injection document. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported. Break-a-rule exercise: on a throwaway branch, weaken one rule and confirm the tests fail; delete the branch. Works in server and client mode. |
 | M10 | Evals harness + first `results.md` (§11.2) `candidate_models` (§3). Per-task evaluation of the six named candidates (`qwen2.5-coder` 7B, 1.5B, 0.5B; Qwen3 8B, 1.7B, 0.6B), the newer Qwen generation and any other Apache-2.0/MIT candidate (§11.2). | Numbers recorded for 7B, 1.5B and 0.5B (the 7B run is required; the development Mac has 16 GB). Candidate check of Apache-2.0/MIT coding models on Ollama recorded with licences; ladder order confirmed or changed by a spec change (§11.2, §6.22). Licence of every ladder model checked on its Ollama page and the §1 table updated. **Per-task round:** before any candidate is run, its licence, pinned tag (explicit `-q4_K_M` when it exists, else the default tag's quantization) and exact size are in the §1 table, and `think: false` is confirmed silent for thinking models on the installed Ollama (version recorded; STOP if it is not). Results per task, for the desktop and the server ladder, with accuracy, speed and temperature. **"sql" and "documents" are decided here** by the 5-point rule; "language" stays on the sql model until M19. Ladder defaults in §3 set from the results by a spec change shown first, each logged in docs/DECISIONS.md. The fine-tuning base for M20 is named. |
 | M11 | `launcher.py` (§9.1), `sidecar.py` (§9.2), PyInstaller spec (§9.3). Before building, generate a full lock file pinning every package, transitive dependencies included. **Server and client packaging:** the `--server` flag and `--create-superadmin`, which passes on to `coalescedb.admin_cli` built at M24 (§9.1); setup for running the server as a service that starts with the machine (systemd unit, launchd plist, Windows service); the desktop build is also the client build. **GPU bundling and Linux:** Ollama bundled with CUDA and ROCm on Windows, CUDA on the Linux server build with ROCm as a separate variant, the standard binary on macOS (§9.2); the Linux server build with its systemd unit (§9.3); the server Docker image with CUDA and ROCm tags (§9.4); `COALESCEDB_OLLAMA_MANAGED` and the sidecar's `OLLAMA_MAX_LOADED_MODELS` (§9.1, §9.2). | Built app starts on a clean machine, downloads the model on first run after consent, works offline after Server mode: the service starts at boot on a clean machine, a client on a second machine connects through a saved server, and a restart of the service signs everyone out. **Decide at M11, with approval:** how the Windows service is registered (a wrapper such as NSSM or `pywin32` would be a new dependency; `subprocess` stays banned outside `llm/sidecar.py`). **Before building:** the redistribution terms of the GPU libraries in the Ollama archives are read and recorded, with the licence texts they require in the bundle (STOP if a library may not be redistributed); the GPUs the shipped Ollama version supports are listed for the README. **After building:** `packaging/SIZES.md` records, per platform and variant, the app's size unpacked and compressed, its five largest packages, and the bundled Ollama with GPU libraries separately (Linux CUDA and ROCm variants and both image tags included). On a machine with no usable GPU the app starts, the benchmark runs on the CPU and picks a model or disables AI. The Linux server build starts under systemd and serves a client. **SQLite in the package:** re-check that `sqlite_dbpage` and `dbstat` are absent from the packaged SQLite or refused (§6.2 step 7), and that the packaged SQLite is 3.34 or later (the guard re-renders `substr` as `SUBSTRING`). |
-| M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 README has the "Running a server" section (§14 item 7b). `ci.yml` (started at M24) extended to Windows and macOS with coverage; `build.yml` also builds the Linux server archive and the server image tags (§11.3). README lists the supported GPUs and the download sizes from `packaging/SIZES.md`. |
+| M12 | CI workflows (§11.3), README (§14), demo GIF, Docker compose (§9.4) | CI green; README meets §14 README has the "Running a server" section (§14 item 7b). `ci.yml` (started at M24) extended to Windows and macOS with coverage; on Windows this is the first run of the `msvcrt` branch of `acquire_instance_lock` (§6.3), so `test_maintenance_lock.py` must pass there; `build.yml` also builds the Linux server archive and the server image tags (§11.3). README lists the supported GPUs and the download sizes from `packaging/SIZES.md`. |
 | M13 | Export (§6.21) + export buttons on Query page | `test_export.py` passes; a 50,000-row result exports in full; formula cells open as text in Excel. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
 | M14 | SQL dump import (§6.19) + SQL dump tab | `test_sql_import.py` passes incl. the malicious dump; a real `pg_dump`/`mysqldump` of a public sample database (e.g. Pagila or Sakila) imports with foreign keys intact. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Works in server and client mode. |
 | M15 | Benchmark & model ladder (§6.22), model state in the status bar, feature gating The server ladder walked by the benchmark (`model_ladder_server` and `ladder_for` themselves arrive at M7), the 7B entry and exact sizes in `KNOWN_MODEL_SIZES`, `CONTEXT_BYTES_PER_SLOT`, the parallel clock-based benchmark, `app_settings` with `desktop_try_7b`, superadmin-only download and benchmark in server mode (§3, §6.22). **Per task:** `AIStatus.active_models`, `task_reasons`, `max_loaded_models`, `loaded_models_reason` (§5); the ladder walked per task with each distinct model benchmarked once; the consent list with its total; the loaded-models rule and the summed RAM rule for an Ollama the app does not manage; `model_switch_notice_s` and the "Loading model" text; gating by task (§6.22). | `test_benchmark.py` passes; with `ai_mode_override=force_off` every non-AI feature still works; startup isn't blocked while benchmarking. UI work follows docs/DESIGN.md; docs/DESIGN.md §8 checklist (all 7 items) reported Server mode: the benchmark runs 3 requests at once and the clock-based rule decides. **Measure and record** the memory per extra parallel slot for each model and replace the provisional `CONTEXT_BYTES_PER_SLOT` values (spec change, shown first). Works in server and client mode. The rest of `test_task_ladders.py` passes. **Measure and record** the switch delay between each pair of ladder models and confirm or change `model_switch_notice_s`; with the default settings (one shared model) behaviour is identical to the single-model form. |
