@@ -302,3 +302,17 @@ Spec only; no code and no test was changed, and nothing was installed.
 | S9 flock | Second spawned process refused (`BlockingIOError`, errno 35); second descriptor in the same process also refused; freed on close and on process exit | "Held" = `BlockingIOError` |
 | S10/S11 row counts | `executemany` on a generator: 1000; empty: 0; UPDATE 0 rows: 0; 2 rows: 2; DDL and SELECT: -1; wrong binding count: `ProgrammingError` (a `DatabaseError`); authorizer denial: `DatabaseError` code 23 (`SQLITE_AUTH`) | `RowConflict` by rowcount; DDL → 0; wrap every `sqlite3.Error`; a denial is never mistaken for busy |
 | S12 backup during a write | `Connection.backup()` from a WAL file finished in 1 ms without waiting; copy holds committed rows only | Snapshots do not block busy tests |
+
+### Round 1 build (Executor, tracing, config, busy handling)
+
+- Round 1 adds only `DatabaseBusy` and `RowConflict` to `errors.py`; `DatabaseInUse` and `AlreadyRunning` wait for round 2 · nothing in round 1 raises them · §4
+- `DatabaseLocks` has only `shared` in round 1; it cannot raise `DatabaseBusy` yet because nothing can hold the exclusive lock. `exclusive`, `InstanceLock` and `acquire_instance_lock` come in round 2 · the Executor needs only the shared lock · §6.3
+- `DatabaseRegistry(..., *, locks=None)` keeps the object as `registry.locks`, and the Executor uses it when `locks=None` · the one optional-keyword change to M3 code; `delete`/`rename` do not use it until round 2 · §6.3, §6.6
+- `open_connection` and `open_internal_connection` yield a `sqlite3.Connection` subclass with `restart_deadline()`; the progress handler and the `QueryTimeout` test read the connection's current deadline · so a write that waited for the lock keeps its whole timeout · §6.4
+- `is_busy_error` lives in `connection.py` and the Executor imports it · one busy test for both modules · §6.4
+- The Executor lets raw busy and "interrupted" errors leave the `open_connection` block, so `DatabaseBusy` and `QueryTimeout` are made there; every other `sqlite3.Error` becomes `ExecutionError` inside the block · §6.4, §6.6
+- Single-row rule in `apply_changes` is decided from the guard's statement kind, not from the SQL text prefix · text matching on SQL is fragile · §6.6
+- A snapshot that fails with an OS or SQLite error becomes `ExecutionError("A backup could not be made, so nothing was changed.")` and is audited as `query_failed` · the spec says only that a failed snapshot stops the change; this keeps "one audit entry per call" true · §6.6 (needs your OK, my addition)
+- If the audit write for a refusal, busy or failure fails, the original error is raised and an `audit_failed` trace is written; if a SELECT's audit write fails the call raises `ExecutionError` and returns no rows · the committed-write rule only covered writes · §6.6 (needs your OK, my addition)
+- `dry_run` audits a guard rejection with source `"nl"` · it has no `source` argument and exists for Generate SQL · §6.6
+- Tracing: `execute` trace line wraps every Executor call including refusals; `guard` lines carry the six allowed keys; nothing else · §6.17

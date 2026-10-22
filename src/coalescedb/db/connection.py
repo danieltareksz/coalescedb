@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from coalescedb.errors import DatabaseNotFound, QueryTimeout
+from coalescedb.errors import DatabaseBusy, DatabaseNotFound, QueryTimeout
 from coalescedb.models import Role
 from coalescedb.security.policy import FORBIDDEN_FUNCTIONS
 
@@ -145,7 +145,30 @@ def _internal_authorizer(
     return _viewer_authorizer(action, arg1, arg2, db_name, source)
 
 
-def _open(path: Path, *, read_only: bool, timeout_s: float) -> sqlite3.Connection:
+class _Connection(sqlite3.Connection):
+    """A connection whose running-time limit can be started again (§6.4)."""
+
+    timeout_s: float = 0.0
+    deadline: float = 0.0
+
+    def restart_deadline(self) -> None:
+        """Start the timeout_s clock again from now."""
+        self.deadline = time.monotonic() + self.timeout_s
+
+
+def is_busy_error(exc: BaseException) -> bool:
+    """True for SQLite's "another connection holds the lock" errors (§6.4).
+
+    Python may report an extended code (SQLITE_BUSY_TIMEOUT, ...), so the code is masked.
+    An OperationalError that SQLite did not raise has no code and is not busy.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _open(path: Path, *, read_only: bool, wait_s: float) -> _Connection:
     path = Path(path)
     if not path.is_file():
         raise DatabaseNotFound()
@@ -153,7 +176,10 @@ def _open(path: Path, *, read_only: bool, timeout_s: float) -> sqlite3.Connectio
     # as_uri() percent-encodes the path, so spaces, "#", "?" and "%" in it are safe.
     uri = path.resolve().as_uri() + ("?mode=ro" if read_only else "?mode=rw")
     # isolation_level=None is autocommit: callers that need a transaction issue BEGIN/COMMIT.
-    return sqlite3.connect(uri, uri=True, timeout=timeout_s, isolation_level=None)
+    # `timeout` is how long SQLite waits for another connection's lock.
+    return sqlite3.connect(
+        uri, uri=True, timeout=wait_s, isolation_level=None, factory=_Connection
+    )
 
 
 def _lock_down(conn: sqlite3.Connection, authorizer: _Authorizer) -> None:
@@ -166,19 +192,37 @@ def _lock_down(conn: sqlite3.Connection, authorizer: _Authorizer) -> None:
     conn.set_authorizer(authorizer)
 
 
-@contextmanager
-def _guarded(conn: sqlite3.Connection, timeout_s: float) -> Iterator[sqlite3.Connection]:
-    """Yield the connection with a deadline; turn SQLite's interrupt into QueryTimeout."""
-    deadline = time.monotonic() + timeout_s
+def _prepare(conn: _Connection, pragmas: tuple[str, ...], authorizer: _Authorizer) -> None:
+    """Run the PRAGMAs, then install the authorizer. A busy file becomes DatabaseBusy."""
+    try:
+        for pragma in pragmas:
+            conn.execute(pragma)
+        _lock_down(conn, authorizer)
+    except BaseException as exc:
+        conn.close()
+        if is_busy_error(exc):
+            raise DatabaseBusy() from exc
+        raise
 
+
+@contextmanager
+def _guarded(conn: _Connection, timeout_s: float) -> Iterator[_Connection]:
+    """Yield the connection with a deadline; turn SQLite's errors into the app's."""
+    conn.timeout_s = timeout_s
+    conn.restart_deadline()
+
+    # Both this handler and the QueryTimeout test below read the CURRENT deadline, so a
+    # restart_deadline() call (after BEGIN IMMEDIATE, §6.6) takes effect at once.
     def past_deadline() -> int:
-        return 1 if time.monotonic() > deadline else 0
+        return 1 if time.monotonic() > conn.deadline else 0
 
     conn.set_progress_handler(past_deadline, _PROGRESS_INTERVAL)
     try:
         yield conn
     except sqlite3.OperationalError as exc:
-        if "interrupted" in str(exc) and time.monotonic() > deadline:
+        if is_busy_error(exc):
+            raise DatabaseBusy() from exc
+        if "interrupted" in str(exc) and time.monotonic() > conn.deadline:
             raise QueryTimeout() from exc
         raise
     finally:
@@ -186,27 +230,31 @@ def _guarded(conn: sqlite3.Connection, timeout_s: float) -> Iterator[sqlite3.Con
 
 
 @contextmanager
-def open_connection(path: Path, role: Role, timeout_s: float) -> Iterator[sqlite3.Connection]:
-    """Open a user database with exactly the powers of `role`."""
+def open_connection(
+    path: Path, role: Role, timeout_s: float, *, busy_timeout_s: float | None = None
+) -> Iterator[_Connection]:
+    """Open a user database with exactly the powers of `role`.
+
+    timeout_s limits how long statements run. busy_timeout_s is how long SQLite waits for
+    another connection's lock; None keeps the M3 behaviour (timeout_s doubles as the wait).
+    """
+    wait_s = timeout_s if busy_timeout_s is None else busy_timeout_s
     if role is Role.ADMIN:
-        conn = _open(path, read_only=False, timeout_s=timeout_s)
-        try:
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA trusted_schema = OFF")
-            _lock_down(conn, _admin_authorizer)
-        except BaseException:
-            conn.close()
-            raise
+        conn = _open(path, read_only=False, wait_s=wait_s)
+        _prepare(
+            conn,
+            (
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA journal_mode = WAL",
+                "PRAGMA trusted_schema = OFF",
+            ),
+            _admin_authorizer,
+        )
     elif role is Role.VIEWER:
-        conn = _open(path, read_only=True, timeout_s=timeout_s)
-        try:
-            conn.execute("PRAGMA query_only = ON")
-            conn.execute("PRAGMA trusted_schema = OFF")
-            _lock_down(conn, _viewer_authorizer)
-        except BaseException:
-            conn.close()
-            raise
+        conn = _open(path, read_only=True, wait_s=wait_s)
+        _prepare(
+            conn, ("PRAGMA query_only = ON", "PRAGMA trusted_schema = OFF"), _viewer_authorizer
+        )
     else:
         raise ValueError("role must be Role.ADMIN or Role.VIEWER")
 
@@ -215,16 +263,17 @@ def open_connection(path: Path, role: Role, timeout_s: float) -> Iterator[sqlite
 
 
 @contextmanager
-def open_internal_connection(path: Path) -> Iterator[sqlite3.Connection]:
-    """Read-only connection for introspection and import checks. Never given user SQL."""
-    conn = _open(path, read_only=True, timeout_s=_INTERNAL_TIMEOUT_S)
-    try:
-        conn.execute("PRAGMA query_only = ON")
-        conn.execute("PRAGMA trusted_schema = OFF")
-        _lock_down(conn, _internal_authorizer)
-    except BaseException:
-        conn.close()
-        raise
+def open_internal_connection(
+    path: Path, *, busy_timeout_s: float | None = None
+) -> Iterator[_Connection]:
+    """Read-only connection for introspection and import checks. Never given user SQL.
+
+    The running limit is a fixed 30 s. busy_timeout_s, when given, is how long SQLite waits
+    for another connection's lock; None keeps the 30 s as the wait too.
+    """
+    wait_s = _INTERNAL_TIMEOUT_S if busy_timeout_s is None else busy_timeout_s
+    conn = _open(path, read_only=True, wait_s=wait_s)
+    _prepare(conn, ("PRAGMA query_only = ON", "PRAGMA trusted_schema = OFF"), _internal_authorizer)
 
     with _guarded(conn, _INTERNAL_TIMEOUT_S) as guarded:
         yield guarded

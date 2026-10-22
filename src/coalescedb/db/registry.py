@@ -17,6 +17,7 @@ from coalescedb.config import Settings
 from coalescedb.db.backup import BackupService, utc_timestamp
 from coalescedb.db.connection import open_internal_connection
 from coalescedb.db.identifiers import validate_db_name
+from coalescedb.db.locks import DatabaseLocks
 from coalescedb.errors import (
     DatabaseExists,
     DatabaseNotFound,
@@ -33,7 +34,17 @@ _VIRTUAL_TABLE_RE = re.compile(r"^\s*CREATE\s+VIRTUAL\s+TABLE\b", re.IGNORECASE)
 
 
 class DatabaseRegistry:
-    def __init__(self, settings: Settings, auth: AuthService, backups: BackupService) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        auth: AuthService,
+        backups: BackupService,
+        *,
+        locks: DatabaseLocks | None = None,
+    ) -> None:
+        # None: a private DatabaseLocks, so a registry used alone works. The app's wiring
+        # passes the one shared object (§6.3).
+        self.locks = DatabaseLocks() if locks is None else locks
         self._settings = settings
         self._auth = auth
         self._backups = backups

@@ -21,6 +21,10 @@ class Settings:
     app_db_path: Path  # data_dir / "app.db"   (users, grants, audit — NOT in databases_dir)
     traces_path: Path  # data_dir / "traces.jsonl"
 
+    # Set by load_settings, never read from the environment. None only for Settings built by
+    # hand (tests); acquire_instance_lock refuses None (§6.3, round 2).
+    instance_lock_path: Path | None = None
+
     ollama_host: str = "http://127.0.0.1:11434"
     # There is no single "ollama_model" setting. After M15, the model in use is decided at
     # runtime by the ladder in §6.22 and stored in AIStatus.active_model. Only until M15
@@ -39,6 +43,11 @@ class Settings:
     login_max_failures: int = 5
     login_lockout_s: int = 300
     backups_to_keep: int = 20
+    # Multi-user groundwork (§3, §6.4, §6.6). busy_timeout_s is how long SQLite waits for
+    # another connection's lock; busy_retries is how many times the Executor retries
+    # BEGIN IMMEDIATE. Separate from query_timeout_s, which limits how long a statement runs.
+    busy_timeout_s: float = 5.0
+    busy_retries: int = 2
 
     # Model ladder & benchmark (§6.22)
     # Ordered list tried by §6.22, biggest first. Both are 4-bit (Q4_K_M).
@@ -122,12 +131,13 @@ def load_settings() -> Settings:
         "app_db_path": data_dir / "app.db",
         "traces_path": data_dir / "traces.jsonl",
         "benchmark_cache_path": data_dir / "benchmark.json",
+        "instance_lock_path": data_dir / "instance.lock",
     }
 
     hints = get_type_hints(Settings)
     for field in fields(Settings):
-        if field.default is MISSING:  # the path fields above; they follow data_dir
-            continue
+        if field.default is MISSING or field.name == "instance_lock_path":
+            continue  # the path fields above; they follow data_dir
         env_name = ENV_PREFIX + field.name.upper()
         raw = os.environ.get(env_name)
         if raw is not None:

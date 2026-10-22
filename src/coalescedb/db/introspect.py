@@ -75,6 +75,19 @@ def _row_count(conn: sqlite3.Connection, table: str, known: set[str]) -> int:
     return conn.execute("SELECT count(*) FROM " + quoted).fetchone()[0]  # nosec B608
 
 
+def object_names(path: Path, *, busy_timeout_s: float | None = None) -> set[str]:
+    """Names of the tables and views, without sqlite_* and _app_* names or row counts.
+
+    Cheap enough to run before every statement: the Executor passes it to the guard as
+    known_tables. A locked file raises DatabaseBusy after busy_timeout_s.
+    """
+    with open_internal_connection(path, busy_timeout_s=busy_timeout_s) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    return {name for (name,) in rows if not name.lower().startswith(("sqlite_", "_app_"))}
+
+
 def list_tables(path: Path) -> list[TableInfo]:
     with open_internal_connection(path) as conn:
         names = list(_user_tables(conn))

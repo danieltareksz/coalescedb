@@ -106,6 +106,23 @@ class ExecutionError(CoalesceDBError):
         self.sqlite_message = sqlite_message
 
 
+class RowConflict(CoalesceDBError):
+    """apply_changes: a row was changed or removed after it was loaded (§6.6)."""
+
+    default_message = "Someone else changed this data since you loaded it. Reload and try again."
+
+    def __init__(self, user_message: str | None = None, *, statement_index: int) -> None:
+        super().__init__(user_message)
+        self.statement_index = statement_index
+
+
+class DatabaseBusy(CoalesceDBError):
+    """Another connection holds SQLite's lock past busy_timeout_s, or the database is being
+    deleted, renamed or restored (§6.3, §6.4)."""
+
+    default_message = "Database busy. Another change is being saved. Try again in a moment."
+
+
 class LLMUnavailable(CoalesceDBError):
     """Ollama not reachable, or the model is missing."""
 
