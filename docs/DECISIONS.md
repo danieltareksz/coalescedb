@@ -252,3 +252,53 @@ Spec only; no code and no test was changed, and nothing was installed.
 - `GuardResult.tables_touched` is not a complete list, and the Executor must not use it for any security decision; only `guard.allowed` decides · SQL can reach a table in ways the parser does not model as one, as the `IN` case showed · §6.6 step 2 (for M5)
 - Break-a-rule, third run (throwaway branch from commit `fba898a`): the `IN` rule switched off (20 tests failed) and `_app_` function names not reserved (1 failed); both made tests fail; branch deleted · same proof for the rules added after the security review · §15 (M4), `test_sql_guard_in.py`
 - The `IN <table>` bypass was found by `/security-review` after the M4 commit; the Gemini review did not find it (Daniel's report) · two independent reviews catch different things, so both stay in the workflow before each milestone commit · Workflow section above
+
+## M5: Executor, backup list/restore, tracing, locks and busy handling (draft, in progress)
+
+### Spec round before the tests
+
+- `instance_lock_path` defaults to `None`; `load_settings` always sets it and never reads it from the environment · a required field would break `test_settings_accepts_keyword_arguments`, which builds `Settings` without it · §3 (G1)
+- New errors `AlreadyRunning`, and keyword constructors for `RowConflict(statement_index=)` and `DatabaseInUse(db_name=, active_sessions=)`, which writes the singular/plural sentence itself · §4 listed them without constructors; nothing in §4 fitted the instance lock · §4 (G2, G19)
+- The Executor retries `BEGIN IMMEDIATE` inside the `open_connection` block on the raw `OperationalError`; any later busy error rolls back and leaves the block, where it becomes `DatabaseBusy` · once the error has left the block the Executor can no longer tell which statement was busy · §6.4, §6.6 (G3)
+- Busy test: `sqlite_errorcode & 0xFF` is `SQLITE_BUSY` or `SQLITE_LOCKED`; an `OperationalError` without `sqlite_errorcode` counts as not busy · Python can report extended codes; errors Python builds itself carry no code · §6.4 (G3)
+- `open_connection` yields a `sqlite3.Connection` subclass with `restart_deadline()`; the Executor calls it after `BEGIN IMMEDIATE`; the progress handler and the `QueryTimeout` translation read the current deadline · with the defaults (5 s wait, 2 retries, 10 s timeout) a write that got the lock late would be interrupted at once (S3) · §6.4, §6.6 (G4)
+- Retry pauses 0.1 s, then 0.3 s for every later retry; `sleep` is an injectable keyword · the spec only named two pauses while `busy_retries` is configurable; tests must not depend on real timing · §6.6 (G5)
+- The shared lock is taken right after the role check and covers the table-name read; `preview` and `dry_run` take it too; `known_tables` comes from the new `introspect.object_names` (tables and views, no row counts) · the guard needs the names, which means reading the file; `list_tables` counts every table's rows; views gave false "not found" warnings · §6.5, §6.6 (G6)
+- One audit entry per call: `query`, `query_rejected` for every refusal (not only the guard's), `query_failed` with the error class only, `query_busy` · the spec only covered success and guard rejections · §6.6 (G7, G8)
+- If the audit write fails after a write has committed: `ExecutionError("The change was saved, but it could not be recorded in the audit log. Tell your administrator.")` plus an `audit_failed` trace line · `DatabaseBusy` would invite a retry that runs the write twice (Daniel's choice, G8b) · §6.6
+- Refused SQL is audited cut to `max_sql_chars`, with `sql_length`; allowed statements are audited as `normalized_sql` · an oversized statement must not bloat `app.db` · §6.6 (G9)
+- Source → audit action: `export`, `ingest`, `sql_import`, `live_import` keep their name; everything else is `query` · §6.6 step 8 named the actions but not the mapping · §6.6 (G10)
+- Snapshot reasons: `destructive_query`, `schema_change`, `editor_delete`, `pre_restore` · the spec left `reason=...` open · §6.6, §6.7 (G11)
+- `apply_schema` accepts CREATE TABLE/INDEX/VIEW and ALTER only, and refuses destructive statements · it has no confirmation text; the designer runs drops through `execute` · §6.6 (G12)
+- `execute_many` checks the shape on the parsed `normalized_sql`: one INSERT, one VALUES row, only anonymous `?` · the guard lets `:x` and `INSERT ... SELECT ?` through · §6.6 (G13)
+- Writes with `RETURNING` return their rows under the row cap and close the cursor before COMMIT; DDL `row_count` is 0 · the guard allows RETURNING; COMMIT fails while the cursor is open (S8) · §6.6 (G14)
+- `dry_run` is built at M5, not M7; `"EXPLAIN " + normalized_sql` is a fixed keyword in front of guard-approved SQL, never a value or identifier · it is part of the §6.6 contract M7 relies on (Daniel's choice, G15) · §6.6
+- `dry_run` binds no parameters: SQL containing `?` raises `ExecutionError` · SQL that needs values cannot run from Generate SQL mode either; the model sees the error like any other (Daniel's choice, option a; S7) · §6.6
+- On any error after `BEGIN IMMEDIATE`, a failed COMMIT included, the Executor runs ROLLBACK itself before the error leaves · with a rollback journal a busy COMMIT leaves the transaction open (S5) · §6.6
+- `BackupService` gets an optional `auth` keyword (type import under `TYPE_CHECKING` only); without it `restore` refuses · `restore` must check the admin role and write an audit entry · §6.7 (G16a)
+- `restore` accepts only a snapshot-named regular file directly inside `backups_dir/<db_name>/` · "within backups_dir" would allow another database's backup or `_deleted` · §6.7 (G16b)
+- `restore` copies the chosen backup to `.restore-<hex>.tmp` in `databases_dir` before the `pre_restore` snapshot, removes it on any failure, and `list_databases` never shows it · the snapshot prunes and could delete the backup being restored; a temp file must never look like a database (Daniel's addition 2) · §6.7 (G16c)
+- `restore` removes the current `-wal`/`-shm`, checks the copy's header and `integrity_check`, audits `db_restore` with the file name only · a stale log must never be applied to the restored file · §6.7 (G16d-f)
+- The registry's presence check stays at M6; at M5 `delete`/`rename`/`restore` take `session_id`, the exclusive lock is built, and `restore` checks `in_use` · `auth.sessions_using` arrives with sessions at M6 · §6.3, §6.7 (G17)
+- Lock messages written out; `rename` locks the old and the new name; `.locks` attributes are public · the spec's message ended in "..."; `test_wiring` (M6) compares the attributes · §6.3 (G18)
+- `acquire_instance_lock` returns an `InstanceLock`; "held" is `BlockingIOError`, never an errno number · errno is 35 on macOS and 11 on Linux (S9) · §6.3 (G19)
+- Tracing: `configure_tracing(path)` (off by default), error class name only, a fixed list of attributes, no SQL text and **no SQL hash**; traces are never rotated (known limitation) · a hash of short SQL can be reversed by guessing (Daniel's addition 3) · §6.17 (G20)
+- `AppStore(path, *, busy_timeout_s=10.0)`; from M6 the wiring always passes `settings.busy_timeout_s` · the default only keeps older callers working (Daniel's addition 1) · §6.1 (G21)
+- The manual canary search at the end of M5: the password canary in `app.db`, `traces.jsonl` and the backups folder; the parameter and result canaries only in `app.db` and `traces.jsonl` · backups contain user data by design (Daniel's addition 4) · §11.1
+- M5 is built in two rounds, each with its tests committed (failing) before its code; the busy tests move to `test_executor_busy.py` · round 2 must never edit a round-1 test file · §15, §11.1
+
+### Scratch checks S1–S12 (Python 3.12.15, SQLite 3.53.1, macOS, before the tests were locked)
+
+| Check | Result | Consequence |
+|---|---|---|
+| S1 busy code | `BEGIN IMMEDIATE` against a held lock: `OperationalError('database is locked')`, `sqlite_errorcode` 5 (plain `SQLITE_BUSY`, not extended) after 0.12 s with `timeout=0.1` | Mask kept (harmless); tests assert `DatabaseBusy`, not the number |
+| S2 after a failed BEGIN | Connection usable, `in_transaction` False; retry on the same connection succeeds once the lock is freed | Retry on the same connection |
+| S3 deadline vs busy wait | Without a restart, a write that waited 0.25 s for the lock with a 0.2 s deadline was interrupted 1 ms after `BEGIN`; with the deadline restarted it ran to the end | `restart_deadline()` required; G4 test fails today |
+| S4 opening while a reader holds a rollback-journal file | Today's `open_connection(ADMIN)` raises a raw `OperationalError` (code 5) from `PRAGMA journal_mode = WAL` | Busy translation must cover opening |
+| S5 busy after `BEGIN IMMEDIATE` | WAL: COMMIT succeeds with a reader open (cannot happen). Rollback journal: COMMIT busy, transaction left open. A captured error keeps code 5 when re-raised | That test uses a seam (proxy raising a captured real busy error at COMMIT); explicit ROLLBACK |
+| S6 viewer during a write | WAL: no wait, sees old rows. Rollback journal: blocked only by a `BEGIN EXCLUSIVE` writer (code 5, 0.12 s) | SELECT-not-retried test uses rollback journal + `BEGIN EXCLUSIVE` |
+| S7 EXPLAIN under the authorizers | `EXPLAIN SELECT` allowed for both roles; missing table/column → `OperationalError`; admin `EXPLAIN DELETE` changes nothing; viewer `EXPLAIN INSERT` → "not authorized"; `EXPLAIN` with `?` and no parameters → `ProgrammingError` | `dry_run` as specified; `?` → `ExecutionError` |
+| S8 RETURNING | COMMIT fails ("SQL statements in progress") while a RETURNING cursor is unread or partly read; `cursor.close()` fixes it and every row was already written | Close the cursor before COMMIT |
+| S9 flock | Second spawned process refused (`BlockingIOError`, errno 35); second descriptor in the same process also refused; freed on close and on process exit | "Held" = `BlockingIOError` |
+| S10/S11 row counts | `executemany` on a generator: 1000; empty: 0; UPDATE 0 rows: 0; 2 rows: 2; DDL and SELECT: -1; wrong binding count: `ProgrammingError` (a `DatabaseError`); authorizer denial: `DatabaseError` code 23 (`SQLITE_AUTH`) | `RowConflict` by rowcount; DDL → 0; wrap every `sqlite3.Error`; a denial is never mistaken for busy |
+| S12 backup during a write | `Connection.backup()` from a WAL file finished in 1 ms without waiting; copy holds committed rows only | Snapshots do not block busy tests |
