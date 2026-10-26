@@ -1324,6 +1324,9 @@ class BackupService:
         # The temporary copy (and any -wal/-shm beside it) is removed on every failure, in
         # a finally block. A copy left behind by a crash is never listed as a database
         # and never touched by list() or restore().
+        # If the live database's stale -wal/-shm cannot be removed (step 8), restore fails
+        # with that OSError and nothing is replaced; removing the temporary copy and its
+        # -wal/-shm is best effort and may fail silently, since any leftover is ignored.
 ```
 
 Built in two steps: `snapshot()` (including pruning) in M3, because the registry's `delete()` needs it; `list()` and `restore()` in M5.
