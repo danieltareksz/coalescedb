@@ -1285,6 +1285,8 @@ class BackupService:
         # deletes regular files directly inside backups_dir/<db>/.
     def list(self, db_name: str) -> list[tuple[datetime, str, Path]]: ...
         # (UTC time, reason, path), newest first. db_name validated (validate_db_name).
+        # The time is timezone-aware (tzinfo=UTC), read from the snapshot's file name; the
+        # UI converts it to local time for display.
         # Only regular files directly inside backups_dir/<db_name>/ whose names match the
         # snapshot pattern; anything else (other files, folders, links) is skipped. No folder
         # -> []. Takes no actor: it returns names and times, no data. The Admin page
@@ -1296,8 +1298,15 @@ class BackupService:
         #   1. auth is None, or auth.role_for(actor, db_name) is not ADMIN -> PermissionDenied.
         #   2. backup_path must be a regular file (not a link) directly inside
         #      backups_dir/<db_name>/ (compared after resolve()) whose name matches the
-        #      snapshot pattern. Another database's folder and _deleted are refused
-        #      (InvalidIdentifier). The database file must exist (DatabaseNotFound).
+        #      snapshot pattern. EVERY refusal in this step raises InvalidIdentifier:
+        #      another database's folder, _deleted, a name that is not a snapshot name, a
+        #      link, a folder, and a backup file that does not exist. The link check
+        #      (is_symlink() on the path as given) runs first; then the shape checks
+        #      (folder after resolve(), file name pattern); then the existence and
+        #      regular-file checks. The link check must come before resolve() because
+        #      resolve() follows links, and a link inside the folder that points at a
+        #      real snapshot would otherwise pass.
+        #      The database file must exist (DatabaseNotFound).
         #   3. in_use(db_name, exclude_session_id=session_id) != 0 -> DatabaseInUse.
         #   4. locks.exclusive(db_name), held to the end.
         #   5. Copy the chosen backup to a temporary file in databases_dir FIRST, named
@@ -1306,7 +1315,9 @@ class BackupService:
         #      prunes, and could otherwise delete the very backup being restored.
         #   6. Check the copy: SQLite header and PRAGMA integrity_check == ok (internal
         #      connection, §6.4). A failure -> IngestError, nothing replaced.
-        #   7. snapshot(path, reason="pre_restore").
+        #   7. self.snapshot(path, reason="pre_restore"), called through self so a
+        #      subclass or a replaced attribute sees it (the tests replace it to watch a
+        #      restore midway and to make it fail).
         #   8. Remove the current database's -wal and -shm files (a stale log must never be
         #      applied to the restored file), then os.replace(copy, path).
         #   9. Audit 'db_restore' with {"backup": <file name only>}.
