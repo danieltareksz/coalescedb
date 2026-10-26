@@ -316,3 +316,17 @@ Spec only; no code and no test was changed, and nothing was installed.
 - If the audit write for a refusal, busy or failure fails, the original error is raised and an `audit_failed` trace is written; if a SELECT's audit write fails the call raises `ExecutionError` and returns no rows · the committed-write rule only covered writes · §6.6 (needs your OK, my addition)
 - `dry_run` audits a guard rejection with source `"nl"` · it has no `source` argument and exists for Generate SQL · §6.6
 - Tracing: `execute` trace line wraps every Executor call including refusals; `guard` lines carry the six allowed keys; nothing else · §6.17
+
+### Round 2 build (locks, instance lock, backup list/restore, AppStore busy)
+
+- `DatabaseLocks.exclusive` and `shared` never wait: each is refused at once with `DatabaseBusy` and the two messages from §6.3; a refused call records nothing · a waiting lock could hang a request or deadlock `rename` · §6.3
+- `delete` takes the exclusive lock after the superadmin check, the typed-name check and `path_for` (name validation), and holds it to the end, including the "database exists" check · the lock key is then always a valid name · §6.3
+- `rename` takes the exclusive lock on the old name, then the new name, after its existence checks and before the checkpoint; if the second is refused the first is released · both without waiting, so no deadlock · §6.3
+- `delete` and `rename` accept `session_id` and do not use it yet · the presence check arrives at M6 · §6.3
+- `acquire_instance_lock` opens the file with `os.open(..., 0o600)`, never writes or deletes it, and on POSIX treats only `BlockingIOError` as "held" (any other `OSError` is raised as it is); the `msvcrt` branch is untested until Windows CI at M12 · errno numbers differ per OS · §6.3
+- `BackupService.restore` validates `db_name` before the role check, so a bad name is `InvalidIdentifier` rather than reaching `role_for` · §6.7
+- `restore` removes the `-wal`/`-shm` files that the read-only integrity check leaves beside the temporary copy, right after the check · the check opens the copy and SQLite cannot remove them from a read-only connection; the tests expect only one `.restore-*` file midway · §6.7 step 6
+- `restore` removes the live database's `-wal`/`-shm` with errors NOT suppressed; the cleanup of the temporary copy suppresses them · a stale log that stays must stop the restore, a leftover temp file need not · §6.7 step 8
+- A damaged backup (wrong header, failed `integrity_check`, or an unreadable file) raises `IngestError("That backup is damaged and can't be restored.")` · §6.7 step 6
+- `AppStore(path, *, busy_timeout_s=10.0)` converts busy errors to `DatabaseBusy` inside `_connect`, which covers opening, every query and every transaction; it imports `is_busy_error` from `db/connection.py` · one busy test everywhere · §6.1, §6.4
+- `list()` sorts by file name, newest first, and reads the time from the name · names begin with a fixed-width UTC timestamp · §6.7

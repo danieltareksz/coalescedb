@@ -4,14 +4,34 @@ snapshot() and pruning are built in M3 because the registry's delete() needs the
 list() and restore() arrive in M5.
 """
 
+import contextlib
+import os
 import re
+import secrets
+import shutil
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from coalescedb.config import Settings
+from coalescedb.db.connection import open_internal_connection
 from coalescedb.db.identifiers import validate_db_name
-from coalescedb.errors import DatabaseNotFound, InvalidIdentifier
+from coalescedb.db.locks import DatabaseLocks
+from coalescedb.errors import (
+    DatabaseInUse,
+    DatabaseNotFound,
+    IngestError,
+    InvalidIdentifier,
+    PermissionDenied,
+)
+from coalescedb.models import Role, User
+
+if TYPE_CHECKING:  # type only: backup.py does not import auth/ at run time
+    from coalescedb.auth.service import AuthService
+
+_SQLITE_HEADER = b"SQLite format 3\x00"
 
 _REASON_RE = re.compile(r"^[a-z_]{1,32}\Z")
 _SNAPSHOT_NAME_RE = re.compile(r"^\d{8}T\d{6}_\d{6}Z_[a-z_]{1,32}\.db\Z")
@@ -23,8 +43,20 @@ def utc_timestamp() -> str:
 
 
 class BackupService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        locks: DatabaseLocks | None = None,
+        in_use: Callable[..., int] | None = None,
+        auth: "AuthService | None" = None,
+    ) -> None:
         self._settings = settings
+        # None: its own locks, so the class works alone. The app's wiring passes the one
+        # shared object (§6.3).
+        self.locks = DatabaseLocks() if locks is None else locks
+        self._in_use = in_use  # the wiring passes auth.sessions_using; None: no check
+        self._auth = auth  # restore() only; None: restore() refuses
 
     def snapshot(self, db_path: Path, reason: str) -> Path:
         """Copy a database into backups_dir/<db>/<timestamp>_<reason>.db, then prune."""
@@ -74,3 +106,103 @@ class BackupService:
         excess = len(snapshots) - max(1, self._settings.backups_to_keep)
         for old in snapshots[: max(0, excess)]:  # names start with the timestamp: oldest first
             old.unlink()
+
+    def list(self, db_name: str) -> list[tuple[datetime, str, Path]]:
+        """(UTC time, reason, path) of a database's snapshots, newest first."""
+        folder = self._settings.backups_dir / validate_db_name(db_name)
+        if not folder.is_dir():
+            return []
+        found = []
+        for path in folder.iterdir():
+            if (
+                _SNAPSHOT_NAME_RE.fullmatch(path.name) is None
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                continue
+            stamp, reason = path.stem.split("Z_", 1)
+            when = datetime.strptime(stamp + "Z", "%Y%m%dT%H%M%S_%fZ").replace(tzinfo=UTC)
+            found.append((when, reason, path))
+        return sorted(found, key=lambda item: item[2].name, reverse=True)
+
+    def restore(
+        self, actor: User, db_name: str, backup_path: Path, *, session_id: str | None = None
+    ) -> None:
+        """Replace a database with one of its own snapshots (§6.7)."""
+        validate_db_name(db_name)
+        # 1. Only an admin of this database, and only if the service is wired to check.
+        if self._auth is None or self._auth.role_for(actor, db_name) is not Role.ADMIN:
+            raise PermissionDenied("Only an admin of this database can restore a backup.")
+        # 2. The backup must be one of this database's own snapshots.
+        backup = self._check_backup_path(db_name, backup_path)
+        path = self._settings.databases_dir.resolve() / f"{db_name}.db"
+        if not path.is_file():
+            raise DatabaseNotFound()
+        # 3. Other sessions have it open: refuse early, with a number.
+        if self._in_use is not None:
+            others = self._in_use(db_name, exclude_session_id=session_id)
+            if others:
+                raise DatabaseInUse(db_name=db_name, active_sessions=others)
+        # 4. Nobody may start using it while the file is replaced.
+        with self.locks.exclusive(db_name):
+            self._replace(actor, db_name, backup, path)
+
+    def _check_backup_path(self, db_name: str, backup_path: Path) -> Path:
+        given = Path(backup_path)
+        refused = InvalidIdentifier("That backup can't be used.")
+        # The link check comes first: resolve() follows links, so a link inside the folder
+        # that points at a real snapshot would otherwise pass.
+        if given.is_symlink():
+            raise refused
+        resolved = given.resolve()
+        folder = (self._settings.backups_dir / db_name).resolve()
+        if resolved.parent != folder or _SNAPSHOT_NAME_RE.fullmatch(resolved.name) is None:
+            raise refused
+        if not resolved.is_file():
+            raise refused
+        return resolved
+
+    def _replace(self, actor: User, db_name: str, backup: Path, path: Path) -> None:
+        # 5. Copy first: the pre_restore snapshot prunes and could delete this very backup.
+        copy = self._settings.databases_dir / f".restore-{secrets.token_hex(8)}.tmp"
+        try:
+            shutil.copyfile(backup, copy)
+            copy.chmod(0o600)
+            # 6. Check the copy before anything is replaced.
+            try:
+                self._check_copy(copy)
+            finally:
+                # The read-only check can leave a log and index file it cannot remove itself.
+                self._remove_sidecars(copy)
+            # 7. Through self, so a replaced attribute or a subclass sees it.
+            self.snapshot(path, reason="pre_restore")
+            # 8. A stale log must never be applied to the restored file.
+            for suffix in ("-wal", "-shm"):  # not suppressed: a stale log must really go
+                path.with_name(path.name + suffix).unlink(missing_ok=True)
+            os.replace(copy, path)
+        finally:
+            with contextlib.suppress(OSError):
+                copy.unlink(missing_ok=True)
+            self._remove_sidecars(copy)
+        # 9. The file name only: never a path.
+        self._auth.audit(actor, "db_restore", db_name, {"backup": backup.name}, "system")
+
+    @staticmethod
+    def _remove_sidecars(path: Path) -> None:
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                path.with_name(path.name + suffix).unlink(missing_ok=True)
+
+    @staticmethod
+    def _check_copy(copy: Path) -> None:
+        damaged = IngestError("That backup is damaged and can't be restored.")
+        with copy.open("rb") as file:
+            if file.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER:
+                raise damaged
+        try:
+            with open_internal_connection(copy) as conn:
+                result = conn.execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError:
+            raise damaged from None
+        if result != [("ok",)]:
+            raise damaged

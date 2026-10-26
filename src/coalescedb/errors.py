@@ -123,6 +123,31 @@ class DatabaseBusy(CoalesceDBError):
     default_message = "Database busy. Another change is being saved. Try again in a moment."
 
 
+class DatabaseInUse(CoalesceDBError):
+    """delete, rename or restore refused: other sessions have the database open (§6.3)."""
+
+    default_message = "That database is open in other sessions."
+
+    def __init__(
+        self, user_message: str | None = None, *, db_name: str, active_sessions: int
+    ) -> None:
+        if user_message is None:
+            who = "1 other session" if active_sessions == 1 else f"{active_sessions} other sessions"
+            user_message = (
+                f'Database "{db_name}" is open in {who}. '
+                "Ask them to switch to another database, then try again."
+            )
+        super().__init__(user_message)
+        self.db_name = db_name
+        self.active_sessions = active_sessions
+
+
+class AlreadyRunning(CoalesceDBError):
+    """Another process holds the data folder (§6.3)."""
+
+    default_message = "CoalesceDB is already running with this data folder."
+
+
 class LLMUnavailable(CoalesceDBError):
     """Ollama not reachable, or the model is missing."""
 

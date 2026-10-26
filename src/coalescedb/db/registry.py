@@ -115,23 +115,31 @@ class DatabaseRegistry:
             raise
         return path
 
-    def delete(self, actor: User, db_name: str, confirm_text: str) -> None:
+    def delete(
+        self, actor: User, db_name: str, confirm_text: str, *, session_id: str | None = None
+    ) -> None:
+        # session_id is accepted at M5 and first used at M6 (the presence check).
         self._auth.require_superadmin(actor)
         if confirm_text != db_name:
             raise PermissionDenied("Type the database's name to confirm deleting it.")
         path = self.path_for(db_name)
-        if not path.is_file():
-            raise DatabaseNotFound()
+        # Never waits: refused with DatabaseBusy if the database is in use. Held to the end,
+        # so the snapshot, the revoke and the file removal are all covered.
+        with self.locks.exclusive(db_name):
+            if not path.is_file():
+                raise DatabaseNotFound()
 
-        # If the snapshot raises, nothing below runs: nothing is deleted or revoked.
-        self._backups.snapshot(path, "db_delete")
-        self._auth.revoke_all(actor, db_name)
-        for file in (path, *self._sidecars(path)):
-            file.unlink(missing_ok=True)
-        self._retire_backups(db_name)
-        self._auth.audit(actor, "db_delete", db_name, {}, "system")
+            # If the snapshot raises, nothing below runs: nothing is deleted or revoked.
+            self._backups.snapshot(path, "db_delete")
+            self._auth.revoke_all(actor, db_name)
+            for file in (path, *self._sidecars(path)):
+                file.unlink(missing_ok=True)
+            self._retire_backups(db_name)
+            self._auth.audit(actor, "db_delete", db_name, {}, "system")
 
-    def rename(self, actor: User, old: str, new: str) -> None:
+    def rename(
+        self, actor: User, old: str, new: str, *, session_id: str | None = None
+    ) -> None:
         self._auth.require_superadmin(actor)
         old_path = self.path_for(old)
         new_path = self.path_for(new)
@@ -141,6 +149,15 @@ class DatabaseRegistry:
         if new_path.exists() or (self._settings.backups_dir / new).exists():
             raise DatabaseExists()
 
+        # The old and the new name, both, taken without waiting so no deadlock is possible.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(self.locks.exclusive(old))
+            stack.enter_context(self.locks.exclusive(new))
+            self._rename_files(actor, old, new, old_path, new_path)
+
+    def _rename_files(
+        self, actor: User, old: str, new: str, old_path: Path, new_path: Path
+    ) -> None:
         # Fold the write-ahead log into the main file first, on a connection opened only
         # for this, so the -wal/-shm files are normally gone before anything moves.
         self._checkpoint(old_path)

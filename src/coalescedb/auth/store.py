@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from coalescedb.errors import UserExists
+from coalescedb.db.connection import is_busy_error
+from coalescedb.errors import DatabaseBusy, UserExists
 from coalescedb.models import User
 
 _SCHEMA = """
@@ -71,8 +72,12 @@ def _user_row(row: tuple | None) -> UserRow | None:
 
 
 class AppStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, busy_timeout_s: float = 10.0) -> None:
+        # How long SQLite waits for another connection's write lock before DatabaseBusy.
+        # The default only keeps callers written before M5 working; the app's wiring passes
+        # settings.busy_timeout_s (§6.1).
         self._path = Path(path)
+        self._busy_timeout_s = busy_timeout_s
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_SCHEMA)
@@ -81,10 +86,15 @@ class AppStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         # One short-lived connection per operation: safe to call from several threads.
         # isolation_level=None means each statement commits on its own unless we BEGIN.
-        conn = sqlite3.connect(self._path, timeout=10.0, isolation_level=None)
+        conn = sqlite3.connect(self._path, timeout=self._busy_timeout_s, isolation_level=None)
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             yield conn
+        except sqlite3.OperationalError as exc:
+            # Opening, every query and every transaction pass through here (§6.4 busy test).
+            if is_busy_error(exc):
+                raise DatabaseBusy() from exc
+            raise
         finally:
             conn.close()
 
