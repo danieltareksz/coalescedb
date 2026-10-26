@@ -22,11 +22,13 @@ from coalescedb.db.locks import DatabaseLocks
 from coalescedb.errors import (
     DatabaseInUse,
     DatabaseNotFound,
+    ExecutionError,
     IngestError,
     InvalidIdentifier,
     PermissionDenied,
 )
 from coalescedb.models import Role, User
+from coalescedb.observability.tracing import trace
 
 if TYPE_CHECKING:  # type only: backup.py does not import auth/ at run time
     from coalescedb.auth.service import AuthService
@@ -184,8 +186,18 @@ class BackupService:
             with contextlib.suppress(OSError):
                 copy.unlink(missing_ok=True)
             self._remove_sidecars(copy)
-        # 9. The file name only: never a path.
-        self._auth.audit(actor, "db_restore", db_name, {"backup": backup.name}, "system")
+        # 9. The file name only: never a path. The file is already replaced, so a failing
+        # audit write must never look like a failed restore (DatabaseBusy would invite a
+        # second restore over the restored data).
+        try:
+            self._auth.audit(actor, "db_restore", db_name, {"backup": backup.name}, "system")
+        except Exception:
+            with trace("audit_failed", method="restore", db_name=db_name, user_id=actor.id):
+                pass
+            raise ExecutionError(
+                "The database was restored, but it could not be recorded in the audit log. "
+                "Tell your administrator."
+            ) from None
 
     @staticmethod
     def _remove_sidecars(path: Path) -> None:

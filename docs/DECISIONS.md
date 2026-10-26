@@ -330,3 +330,13 @@ Spec only; no code and no test was changed, and nothing was installed.
 - A damaged backup (wrong header, failed `integrity_check`, or an unreadable file) raises `IngestError("That backup is damaged and can't be restored.")` · §6.7 step 6
 - `AppStore(path, *, busy_timeout_s=10.0)` converts busy errors to `DatabaseBusy` inside `_connect`, which covers opening, every query and every transaction; it imports `is_busy_error` from `db/connection.py` · one busy test everywhere · §6.1, §6.4
 - `list()` sorts by file name, newest first, and reads the time from the name · names begin with a fixed-width UTC timestamp · §6.7
+
+### End of milestone: checks and review fixes
+
+- Manual canary run (scratchpad script, every Executor path, login, password change, delete with backup, restore): `grep -c` gave 0 for the password canary in `app.db`, `traces.jsonl` and every backup file, and 0 for the parameter and result canaries in `app.db` and `traces.jsonl`; positive controls were non-zero. The shell's `grep` on this Mac is ugrep, which silently skips binary files, so the check uses `/usr/bin/grep` (BSD 2.6.0) · a grep that skips SQLite files would report a false 0 · §11.1
+- Offline check: `test_executor_makes_no_network_connection` passes. Port check: not applicable at M5 (nothing listens until M6) · §10
+- `/security-review` of `m4..HEAD` (src): no findings above the confidence bar · Workflow
+- Restore: if the `db_restore` audit write fails after `os.replace`, an `audit_failed` trace line is written (`method="restore"`) and `ExecutionError("The database was restored, but it could not be recorded in the audit log. Tell your administrator.")` is raised, never `DatabaseBusy` · "busy" reads as "nothing happened", and a second restore would take its `pre_restore` snapshot of the already-restored data · §6.7 step 9 (found by: REVIEWER NOT GIVEN)
+- `dry_run`'s `execute` trace line always carries `method`, `source` (`"nl"`), `db_name`, `user_id`, `statement_count` (1) and `busy_retries_used` (0), like every other call; `row_count` and `truncated` only when a call produces a result · §6.17 was an allow-list, so `dry_run` was within the rule but inconsistent with `_run_call`; the rule now says which keys are always present · §6.17 (found by: REVIEWER NOT GIVEN)
+- `tracing.recent()` skips lines that are not valid JSON; `n` counts valid lines · `_append` swallows `OSError`, so a full disk can leave a half line that made `recent()` raise · §6.17 (found by: REVIEWER NOT GIVEN)
+- Review fixes tested in a new file, `tests/test_m5_review_fixes.py` (spec and tests committed first, `5f0070f`) · existing test files are never edited · §11.1

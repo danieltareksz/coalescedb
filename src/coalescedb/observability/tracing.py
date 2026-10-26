@@ -63,12 +63,19 @@ def trace(event: str, **attrs) -> Iterator[dict]:
 
 
 def recent(n: int = 100) -> list[dict]:
-    """The last n trace lines, oldest first. [] when tracing is off or nothing is written."""
+    """The last n valid trace lines, oldest first. [] when tracing is off or nothing is
+    written. A line that is not valid JSON (cut short by a crash or a full disk) is skipped."""
     if n < 1:
         return []
     with _lock:
         path = _path
         if path is None or not path.is_file():
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines[-n:]]
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    parsed = []
+    for line in lines:
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return parsed[-n:]

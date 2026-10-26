@@ -236,8 +236,16 @@ class Executor:
         Never retried, never in a transaction, and audited only when refused.
         """
         call = _Call("dry_run", "nl", session, [sql], single=True)
+        # The same always-present keys as every other call (§6.17); dry_run runs one
+        # statement and is never retried.
         with trace(
-            "execute", method="dry_run", db_name=session.db_name, user_id=session.user.id
+            "execute",
+            method="dry_run",
+            source=call.source,
+            db_name=session.db_name,
+            user_id=session.user.id,
+            statement_count=1,
+            busy_retries_used=0,
         ) as attrs:
             try:
                 db_name = self._require_db(session)
