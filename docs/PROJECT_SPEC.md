@@ -1320,7 +1320,13 @@ class BackupService:
         #      restore midway and to make it fail).
         #   8. Remove the current database's -wal and -shm files (a stale log must never be
         #      applied to the restored file), then os.replace(copy, path).
-        #   9. Audit 'db_restore' with {"backup": <file name only>}.
+        #   9. Audit 'db_restore' with {"backup": <file name only>}. The file is already
+        #      replaced, so a failing audit write must never look like a failed restore:
+        #      any exception from it (DatabaseBusy included) is caught, an audit_failed
+        #      trace line is written (method="restore", db_name, user_id; §6.17) and
+        #      ExecutionError("The database was restored, but it could not be recorded in
+        #      the audit log. Tell your administrator.") is raised. Same rule as §6.6 for a
+        #      committed write. Never DatabaseBusy after the file is replaced.
         # The temporary copy (and any -wal/-shm beside it) is removed on every failure, in
         # a finally block. A copy left behind by a crash is never listed as a database
         # and never touched by list() or restore().
@@ -1706,6 +1712,8 @@ def trace(event: str, **attrs) -> Iterator[dict]: ...
     # The yielded dict can be filled in during the block (row_count, etc.).
 def recent(n: int = 100) -> list[dict]: ...
     # The last n lines, oldest first. [] when tracing is off or the file does not exist.
+    # A line that is not valid JSON (for example the last line, cut short by a crash or a
+    # full disk) is skipped, never raised; n counts the valid lines returned.
 ```
 
 Traced: every LLM call (model, tokens, latency), every guard decision, every execution. No document text or query results are written to traces (only lengths).
@@ -1713,8 +1721,8 @@ Traced: every LLM call (model, tokens, latency), every guard decision, every exe
 **What the Executor traces (M5).** Allowed attributes only; nothing else goes in:
 
 - `guard`: `allowed`, `kind`, `is_destructive`, `reason_count`, `sql_chars`, `tables_touched`.
-- `execute`: `method`, `source`, `db_name`, `user_id`, `kind`, `statement_count`, `row_count`, `truncated`, `busy_retries_used`.
-- `audit_failed`: `method`, `db_name`, `user_id` (§6.6).
+- `execute`: `method`, `source`, `db_name`, `user_id`, `kind`, `statement_count`, `row_count`, `truncated`, `busy_retries_used`. Every `execute` line, `dry_run`'s included, always carries `method`, `source`, `db_name`, `user_id`, `statement_count` and `busy_retries_used`; `kind` once the guard has run; `row_count` and `truncated` only when the call produced a result. `dry_run` traces `source="nl"` (as its audit entry does), `statement_count=1` and `busy_retries_used=0` (it is never retried).
+- `audit_failed`: `method`, `db_name`, `user_id` (§6.6, and §6.7 step 9 with `method="restore"`).
 
 Never in a trace: SQL text, a hash of SQL (a hash of short SQL can be reversed by guessing), parameter values, result rows, passwords, session ids, error messages.
 
