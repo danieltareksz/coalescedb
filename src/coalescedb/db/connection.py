@@ -168,6 +168,18 @@ def is_busy_error(exc: BaseException) -> bool:
     return code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
+def is_interrupt_error(exc: BaseException) -> bool:
+    """True when the progress handler stopped a statement (SQLITE_INTERRUPT, §6.4).
+
+    Decided by the error code, never the message: "no such column: interrupted" is an
+    ordinary error.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) == sqlite3.SQLITE_INTERRUPT
+
+
 def _open(path: Path, *, read_only: bool, wait_s: float) -> _Connection:
     path = Path(path)
     if not path.is_file():
@@ -222,7 +234,7 @@ def _guarded(conn: _Connection, timeout_s: float) -> Iterator[_Connection]:
     except sqlite3.OperationalError as exc:
         if is_busy_error(exc):
             raise DatabaseBusy() from exc
-        if "interrupted" in str(exc) and time.monotonic() > conn.deadline:
+        if is_interrupt_error(exc) and time.monotonic() > conn.deadline:
             raise QueryTimeout() from exc
         raise
     finally:

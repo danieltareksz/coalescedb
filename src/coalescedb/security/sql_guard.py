@@ -99,6 +99,11 @@ def _validate_parsed(sql: str, role: Role, known_tables: set[str]) -> GuardResul
     if kind not in ROLE_PERMISSIONS[role]:
         return _reject(VIEWER_MESSAGE, kind)
 
+    # An aliased INSERT target: sqlglot 30.21.0 reads the column list as the alias's and
+    # drops it when re-rendering, so the values would land in the wrong columns.
+    if kind is StatementKind.INSERT and _insert_target_has_alias(root):
+        return _reject("The table in an INSERT cannot have an alias.", kind)
+
     # 6. Deep walk for forbidden nodes, and 7. protected names.
     tables: list[str] = []
     index_names: list[str] = []
@@ -281,10 +286,26 @@ def _new_names(root: exp.Expression) -> set[str]:
     return names
 
 
+def _insert_target_has_alias(root: exp.Expression) -> bool:
+    target = root.this
+    if isinstance(target, exp.Schema):
+        target = target.this
+    return isinstance(target, exp.Table) and target.args.get("alias") is not None
+
+
 def _is_destructive(root: exp.Expression, kind: StatementKind) -> bool:
-    """Step 9: DROP; DELETE / UPDATE without WHERE; ALTER TABLE other than ADD COLUMN."""
+    """Step 9: DROP; DELETE / UPDATE without WHERE; ALTER TABLE other than ADD COLUMN;
+    INSERT OR REPLACE and INSERT ... ON CONFLICT ... DO UPDATE."""
     if kind is StatementKind.DROP:
         return True
+    if kind is StatementKind.INSERT:
+        # A replace deletes the conflicting row (and its ON DELETE CASCADE children); an
+        # upsert overwrites existing rows. DO NOTHING and the other alternatives don't.
+        if str(root.args.get("alternative") or "").upper() == "REPLACE":
+            return True
+        conflict = root.args.get("conflict")
+        action = conflict.args.get("action") if conflict is not None else None
+        return action is not None and "UPDATE" in action.name.upper()
     if kind in (StatementKind.DELETE, StatementKind.UPDATE):
         return root.args.get("where") is None
     if kind is StatementKind.ALTER_TABLE:

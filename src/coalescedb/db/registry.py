@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from coalescedb.auth.service import AuthService
-from coalescedb.config import Settings
+from coalescedb.config import Settings, create_private_file
 from coalescedb.db.backup import BackupService, utc_timestamp
 from coalescedb.db.connection import open_internal_connection
 from coalescedb.db.identifiers import validate_db_name
@@ -100,6 +100,10 @@ class DatabaseRegistry:
             raise DatabaseExists()
 
         self._claim_name(actor, db_name)
+        # Owner only (§3): the file exists, 0o600, before SQLite opens it, so its -wal/-shm
+        # get the same mode.
+        if not create_private_file(path):
+            raise DatabaseExists()
         try:
             conn = sqlite3.connect(path)
             try:
@@ -204,6 +208,7 @@ class DatabaseRegistry:
         temp = self._settings.databases_dir / f".import-{secrets.token_hex(8)}.tmp"
         try:
             try:
+                create_private_file(temp)  # owner only before any byte is copied (§3)
                 shutil.copyfile(src, temp)
                 self._check_import(temp)
             except IngestError:

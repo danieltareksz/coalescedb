@@ -22,7 +22,7 @@ from sqlglot import exp
 from coalescedb.auth.service import AuthService
 from coalescedb.config import Settings
 from coalescedb.db.backup import BackupService
-from coalescedb.db.connection import is_busy_error, open_connection
+from coalescedb.db.connection import is_busy_error, is_interrupt_error, open_connection
 from coalescedb.db.introspect import object_names
 from coalescedb.db.locks import DatabaseLocks
 from coalescedb.db.registry import DatabaseRegistry
@@ -57,6 +57,10 @@ _SCHEMA_KINDS = frozenset(
 _CHANGE_KINDS = frozenset({StatementKind.INSERT, StatementKind.UPDATE, StatementKind.DELETE})
 
 _RETRY_PAUSES_S = (0.1, 0.3)  # before the first retry, then before every later one
+
+MAX_BATCH_STATEMENTS = 1000  # apply_schema and apply_changes; §6.28 allows 1,000 changes
+_AUDIT_SQL_ITEMS = 100  # an audit entry lists at most this many statements
+_TOO_MANY = "At most 1,000 statements can be applied at once."
 
 _SAVED_BUT_NOT_RECORDED = (
     "The change was saved, but it could not be recorded in the audit log. "
@@ -174,6 +178,7 @@ class Executor:
         call = _Call("apply_schema", source, session, list(ddl), single=False)
 
         def body(role: Role, path: Path, known: set[str]) -> None:
+            self._require_batch_size(ddl)
             guards = self._guard_all(role, known, ddl)
             reasons = []
             for guard in guards:
@@ -208,6 +213,7 @@ class Executor:
         )
 
         def body(role: Role, path: Path, known: set[str]) -> int:
+            self._require_batch_size(call.raw_sql)
             guards = self._guard_all(role, known, call.raw_sql)
             reasons = []
             for guard in guards:
@@ -217,6 +223,10 @@ class Executor:
                     reasons.append("A change without a WHERE clause is not allowed here.")
             if reasons:
                 raise SQLRejected(reasons=list(dict.fromkeys(reasons)))
+            for guard in guards:
+                if guard.kind is StatementKind.INSERT:
+                    # Through self, with one argument: the same strict shape as execute_many.
+                    self._check_bulk_insert_shape(guard.normalized_sql or "")
             call.is_write = True
             call.sql = [guard.normalized_sql or "" for guard in guards]
             call.kinds = [guard.kind for guard in guards]
@@ -372,14 +382,29 @@ class Executor:
             raise PermissionDenied("Type the database's name to confirm this change.")
 
     @staticmethod
+    def _require_batch_size(statements: Sequence[Any]) -> None:
+        """Checked before any statement is guarded (§6.6)."""
+        if len(statements) > MAX_BATCH_STATEMENTS:
+            raise SQLRejected(reasons=[_TOO_MANY])
+
+    @staticmethod
     def _check_bulk_insert_shape(sql: str) -> None:
-        """One INSERT ... VALUES row whose every value is an anonymous "?" (§6.6)."""
-        problem = "execute_many needs one INSERT with a single VALUES row of ? placeholders."
+        """One INSERT ... VALUES row whose every value is an anonymous "?", and nothing else:
+        no OR alternative, ON CONFLICT, WITH, RETURNING or alias (§6.6)."""
+        problem = "An INSERT here must be one VALUES row of ? placeholders and nothing else."
         try:
             root = sqlglot.parse_one(sql, read="sqlite")
         except sqlglot.errors.SqlglotError:
             raise SQLRejected(reasons=[problem]) from None
-        values = root.args.get("expression") if isinstance(root, exp.Insert) else None
+        if not isinstance(root, exp.Insert):
+            raise SQLRejected(reasons=[problem])
+        # Only the target and the VALUES row may be set; any other part is refused.
+        if any(value for key, value in root.args.items() if key not in ("this", "expression")):
+            raise SQLRejected(reasons=[problem])
+        target = root.this.this if isinstance(root.this, exp.Schema) else root.this
+        if not isinstance(target, exp.Table) or target.args.get("alias") is not None:
+            raise SQLRejected(reasons=[problem])
+        values = root.args.get("expression")
         if not isinstance(values, exp.Values) or len(values.expressions) != 1:
             raise SQLRejected(reasons=[problem])
         row = values.expressions[0]
@@ -428,7 +453,7 @@ class Executor:
     def _reraise(exc: sqlite3.Error) -> None:
         """Busy and timeout errors leave raw (open_connection turns them into DatabaseBusy
         and QueryTimeout); every other sqlite3.Error becomes ExecutionError."""
-        if is_busy_error(exc) or "interrupted" in str(exc):
+        if is_busy_error(exc) or is_interrupt_error(exc):
             raise exc
         raise ExecutionError(sqlite_message=str(exc)) from exc
 
@@ -530,8 +555,8 @@ class Executor:
         *,
         conflicts: bool,
     ) -> int:
-        """Several statements in one transaction. With `conflicts`, every UPDATE and DELETE
-        must change exactly one row (apply_changes)."""
+        """Several statements in one transaction. With `conflicts`, every INSERT, UPDATE and
+        DELETE must change exactly one row (apply_changes)."""
         kinds = call.kinds
         started = time.perf_counter()
         with self._open(role, path) as conn:
@@ -547,7 +572,7 @@ class Executor:
                             count = max(cursor.rowcount, 0)
                     finally:
                         cursor.close()
-                    one_row = kinds[index] in (StatementKind.UPDATE, StatementKind.DELETE)
+                    one_row = kinds[index] in _CHANGE_KINDS
                     if conflicts and one_row and count != 1:
                         raise RowConflict(statement_index=index)
                     changed += count
@@ -564,7 +589,11 @@ class Executor:
                 "elapsed_ms": elapsed_ms,
             }
         else:
-            call.detail = {"sql": call.sql, "counts": call.counts, "elapsed_ms": elapsed_ms}
+            call.detail = {
+                **self._sql_list(call.sql),
+                "counts": call.counts,
+                "elapsed_ms": elapsed_ms,
+            }
         return changed
 
     # --- audit ---------------------------------------------------------------------------
@@ -608,20 +637,25 @@ class Executor:
         cut = [sql[:limit] for sql in call.raw_sql]
         lengths = [len(sql) for sql in call.raw_sql]
         reasons = exc.reasons if isinstance(exc, SQLRejected) and exc.reasons else None
-        detail: dict[str, Any] = {
-            "reasons": list(reasons or [exc.user_message]),
-            "sql": cut[0] if call.single else cut,
-            "sql_length": lengths[0] if call.single else lengths,
-        }
+        detail: dict[str, Any] = {"reasons": list(reasons or [exc.user_message])}
+        if call.single:
+            detail.update(sql=cut[0], sql_length=lengths[0])
+        else:
+            detail.update(self._sql_list(cut))
+            detail["sql_length"] = lengths[:_AUDIT_SQL_ITEMS]
         self._audit_quiet(call, "query_rejected", detail)
 
     def _busy_detail(self, call: _Call) -> dict[str, Any]:
         limit = self._settings.max_sql_chars
         sql = call.sql or [text[:limit] for text in call.raw_sql]
-        return {
-            "sql": sql[0] if call.single else sql,
-            "busy_retries_used": call.retries,
-        }
+        detail = {"sql": sql[0]} if call.single else self._sql_list(sql)
+        return {**detail, "busy_retries_used": call.retries}
+
+    @staticmethod
+    def _sql_list(sql: list[str]) -> dict[str, Any]:
+        """A batch's statements for the audit log: at most the first 100, and the full
+        count, so one entry never holds 1,000 long statements (§6.6)."""
+        return {"sql": sql[:_AUDIT_SQL_ITEMS], "statement_count": len(sql)}
 
     def _failed_detail(self, call: _Call, exc: BaseException) -> dict[str, Any]:
         detail: dict[str, Any] = {"error": type(exc).__name__}  # the class name only
@@ -629,7 +663,7 @@ class Executor:
             detail["sql"] = call.sql[0]
             detail["kind"] = call.kind.value if call.kind else None
         elif call.method == "apply_schema" and call.sql:
-            detail["sql"] = call.sql
+            detail.update(self._sql_list(call.sql))
             detail["counts"] = call.counts
         elif call.method == "apply_changes" and call.sql:
             detail["counts"] = call.counts

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from coalescedb.config import PRIVATE_FILE_MODE, create_private_file, make_private
 from coalescedb.db.connection import is_busy_error
 from coalescedb.errors import DatabaseBusy, UserExists
 from coalescedb.models import User
@@ -78,6 +79,12 @@ class AppStore:
         # settings.busy_timeout_s (§6.1).
         self._path = Path(path)
         self._busy_timeout_s = busy_timeout_s
+        # Owner only (§3): a new app.db is created 0o600 before SQLite opens it, so its
+        # -wal/-shm follow; an existing one and its log files are tightened.
+        create_private_file(self._path)
+        for file in (self._path, *(self._path.with_name(self._path.name + suffix)
+                                   for suffix in ("-wal", "-shm"))):
+            make_private(file, PRIVATE_FILE_MODE)
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_SCHEMA)

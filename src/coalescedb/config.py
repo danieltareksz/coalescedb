@@ -1,6 +1,7 @@
 """Settings and paths (PROJECT_SPEC.md §3)."""
 
 import os
+import stat
 import sys
 from dataclasses import MISSING, dataclass, fields
 from pathlib import Path
@@ -9,6 +10,29 @@ from typing import Literal, get_args, get_origin, get_type_hints
 import platformdirs
 
 ENV_PREFIX = "COALESCEDB_"
+
+# File permissions (§3): owner only. POSIX only; on Windows the folder's ACLs decide (M12).
+_POSIX = os.name == "posix"
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def create_private_file(path: Path) -> bool:
+    """Create an empty owner-only file before anything else opens it. False if it exists."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
+def make_private(path: Path, mode: int) -> None:
+    """Remove any permission bits beyond `mode` from an existing path (POSIX)."""
+    if not _POSIX or not path.exists() or path.is_symlink():
+        return
+    if stat.S_IMODE(path.stat().st_mode) & ~mode:
+        os.chmod(path, mode)
 
 
 # kw_only: benchmark_cache_path has no default but follows fields that do, which a plain
@@ -116,6 +140,8 @@ def _coerce(env_name: str, raw: str, hint: object) -> object:
 def load_settings() -> Settings:
     """Build Settings: defaults, then COALESCEDB_* environment variables, then frozen."""
     env_data_dir = os.environ.get(ENV_PREFIX + "DATA_DIR")
+    # Dev mode: data_dir is the current folder (usually the repository), never tightened.
+    dev_mode = not env_data_dir and not getattr(sys, "frozen", False)
     if env_data_dir:
         data_dir = Path(env_data_dir)
     elif getattr(sys, "frozen", False):  # packaged executable
@@ -148,6 +174,20 @@ def load_settings() -> Settings:
         raise ValueError(f"{ENV_PREFIX}MODEL_LADDER must name at least one model")
 
     for directory in (settings.data_dir, settings.databases_dir, settings.backups_dir):
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    # mkdir leaves an existing folder as it was, so a looser one is tightened here.
+    folders = [settings.databases_dir, settings.backups_dir]
+    if not dev_mode:
+        folders.append(settings.data_dir)
+    for directory in folders:
+        make_private(directory, PRIVATE_DIR_MODE)
 
     return settings
+
+
+def check_data_dir_permissions(settings: Settings) -> bool:
+    """True when group or others can use data_dir (dev mode leaves it open). From M6 the
+    wiring writes a `data_dir_open` trace line when this is True (§3, §6.17)."""
+    if not _POSIX:
+        return False
+    return bool(stat.S_IMODE(settings.data_dir.stat().st_mode) & 0o077)

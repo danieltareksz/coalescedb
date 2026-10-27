@@ -10,12 +10,13 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from coalescedb.config import Settings
+from coalescedb.config import Settings, create_private_file
 from coalescedb.db.connection import open_internal_connection
 from coalescedb.db.identifiers import validate_db_name
 from coalescedb.db.locks import DatabaseLocks
@@ -59,6 +60,9 @@ class BackupService:
         self.locks = DatabaseLocks() if locks is None else locks
         self._in_use = in_use  # the wiring passes auth.sessions_using; None: no check
         self._auth = auth  # restore() only; None: restore() refuses
+        # One snapshot (copy and prune) at a time, so a prune never removes a file that
+        # another snapshot of this process is still writing or has just made.
+        self._snapshot_lock = threading.Lock()
 
     def snapshot(self, db_path: Path, reason: str) -> Path:
         """Copy a database into backups_dir/<db>/<timestamp>_<reason>.db, then prune."""
@@ -72,29 +76,50 @@ class BackupService:
         if not db_path.is_file():
             raise DatabaseNotFound()
 
-        folder = self._settings.backups_dir / db_name
+        folder = self._backup_folder(db_name)
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target = folder / f"{utc_timestamp()}_{reason}.db"
-        while target.exists():  # two snapshots in the same microsecond
-            target = folder / f"{utc_timestamp()}_{reason}.db"
-
-        # Connection.backup() copies a consistent picture of the database, including rows
-        # that are still only in its write-ahead log.
-        source = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            destination = sqlite3.connect(target)
+        self._check_folder(folder)  # again: mkdir follows a link made in between
+        with self._snapshot_lock:
+            target = self._new_snapshot_file(folder, reason)
+            # Connection.backup() copies a consistent picture of the database, including
+            # rows that are still only in its write-ahead log.
+            source = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
             try:
-                source.backup(destination)
+                destination = sqlite3.connect(target)
+                try:
+                    source.backup(destination)
+                finally:
+                    destination.close()
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
             finally:
-                destination.close()
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
-        finally:
-            source.close()
-
-        self._prune(folder)
+                source.close()
+            self._prune(folder)
         return target
+
+    def _backup_folder(self, db_name: str) -> Path:
+        """backups_dir/<db_name>, refused if it is a link or resolves anywhere else (§6.7)."""
+        folder = self._settings.backups_dir / db_name
+        self._check_folder(folder)
+        return folder
+
+    def _check_folder(self, folder: Path) -> None:
+        refused = InvalidIdentifier("That backup folder can't be used.")
+        if folder.is_symlink():
+            raise refused
+        if folder.exists() and folder.resolve().parent != self._settings.backups_dir.resolve():
+            raise refused
+
+    @staticmethod
+    def _new_snapshot_file(folder: Path, reason: str) -> Path:
+        """Create an empty, owner-only snapshot file under a name nobody else has taken."""
+        while True:
+            target = folder / f"{utc_timestamp()}_{reason}.db"
+            # Exclusive create: if another snapshot took this name in the same microsecond,
+            # it fails and the next timestamp is tried. Owner only (§3).
+            if create_private_file(target):
+                return target
 
     def _prune(self, folder: Path) -> None:
         """Keep the newest backups_to_keep snapshots in one database's folder."""
@@ -156,8 +181,11 @@ class BackupService:
         # that points at a real snapshot would otherwise pass.
         if given.is_symlink():
             raise refused
+        try:
+            folder = self._backup_folder(db_name).resolve()
+        except InvalidIdentifier:
+            raise refused from None
         resolved = given.resolve()
-        folder = (self._settings.backups_dir / db_name).resolve()
         if resolved.parent != folder or _SNAPSHOT_NAME_RE.fullmatch(resolved.name) is None:
             raise refused
         if not resolved.is_file():
@@ -168,8 +196,8 @@ class BackupService:
         # 5. Copy first: the pre_restore snapshot prunes and could delete this very backup.
         copy = self._settings.databases_dir / f".restore-{secrets.token_hex(8)}.tmp"
         try:
+            create_private_file(copy)  # owner only before any byte is copied (§3)
             shutil.copyfile(backup, copy)
-            copy.chmod(0o600)
             # 6. Check the copy before anything is replaced.
             try:
                 self._check_copy(copy)
