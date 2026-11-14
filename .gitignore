@@ -1,1 +1,24 @@
 .venv/
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+databases/
+models/
+build/
+dist/
+resources/ollama/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+backups/
+traces.jsonl
+benchmark.json
+.vscode/
+.DS_Store
+
+# Claude Code per-machine settings
+.claude/settings.local.json
