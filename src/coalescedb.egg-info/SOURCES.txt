@@ -1,0 +1,12 @@
+pyproject.toml
+src/coalescedb/__init__.py
+src/coalescedb/config.py
+src/coalescedb/errors.py
+src/coalescedb/models.py
+src/coalescedb.egg-info/PKG-INFO
+src/coalescedb.egg-info/SOURCES.txt
+src/coalescedb.egg-info/dependency_links.txt
+src/coalescedb.egg-info/requires.txt
+src/coalescedb.egg-info/top_level.txt
+src/coalescedb/db/__init__.py
+src/coalescedb/db/identifiers.py

@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: coalescedb
+Version: 0.1.0
+Summary: Local-first database management GUI for SQLite with role-based access and a local LLM.
+License-Expression: MIT
+Requires-Python: <3.13,>=3.11
+Requires-Dist: platformdirs
